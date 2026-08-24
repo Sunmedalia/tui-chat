@@ -1,0 +1,188 @@
+syntax = "proto3";
+
+package tuichat.v1;
+
+message Frame {
+  uint32 protocol_version = 1;
+  string id = 2;
+  oneof body {
+    ClientHello client_hello = 10;
+    AuthChallenge auth_challenge = 11;
+    DeviceAuth device_auth = 12;
+    PasswordAuth password_auth = 13;
+    Authenticated authenticated = 14;
+    BootstrapDevice bootstrap_device = 15;
+    ChangePassword change_password = 16;
+    LookupUser lookup_user = 20;
+    UserBundle user_bundle = 21;
+    PublishPreKeys publish_pre_keys = 22;
+    ClaimPreKey claim_pre_key = 23;
+    PreKeyBundle pre_key_bundle = 24;
+    SendEnvelopes send_envelopes = 30;
+    SendAccepted send_accepted = 31;
+    SyncRequest sync_request = 32;
+    SyncBatch sync_batch = 33;
+    AckEnvelope ack_envelope = 34;
+    DeliveryUpdate delivery_update = 35;
+    PairingRequest pairing_request = 40;
+    PairingEvent pairing_event = 41;
+    ActivateDevice activate_device = 42;
+    AckPairingEvent ack_pairing_event = 43;
+    Error error = 90;
+    Ping ping = 91;
+    Pong pong = 92;
+    OperationOk operation_ok = 93;
+  }
+}
+
+message ClientHello {
+  string username = 1;
+  string device_id = 2;
+}
+
+message AuthChallenge {
+  bytes nonce = 1;
+  int64 expires_at_ms = 2;
+}
+
+message DeviceAuth {
+  string username = 1;
+  string device_id = 2;
+  bytes signature = 3;
+}
+
+message PasswordAuth {
+  string username = 1;
+  string password = 2;
+  string device_id = 3;
+}
+
+message Authenticated {
+  string account_id = 1;
+  string username = 2;
+  string device_id = 3;
+  bool password_change_required = 4;
+  bool pending_device = 5;
+  bytes account_master_key = 6;
+  uint64 roster_revision = 7;
+  BootstrapMode bootstrap_mode = 8;
+}
+
+enum BootstrapMode {
+  BOOTSTRAP_MODE_NONE = 0;
+  BOOTSTRAP_MODE_FIRST_DEVICE = 1;
+  BOOTSTRAP_MODE_PENDING_DEVICE = 2;
+}
+
+message BootstrapDevice {
+  string device_id = 1;
+  string device_name = 2;
+  bytes account_master_key = 3;
+  bytes auth_signing_key = 4;
+  bytes olm_ed25519_key = 5;
+  bytes olm_curve25519_key = 6;
+  bytes certificate_signature = 7;
+  repeated OneTimeKey one_time_keys = 8;
+  bytes sas_public_key = 9;
+}
+
+message ChangePassword {
+  string current_password = 1;
+  string new_password = 2;
+}
+
+message LookupUser { string exact_username = 1; }
+
+message UserBundle {
+  string account_id = 1;
+  string username = 2;
+  bytes account_master_key = 3;
+  uint64 roster_revision = 4;
+  repeated DeviceBundle devices = 5;
+}
+
+message DeviceBundle {
+  string device_id = 1;
+  string device_name = 2;
+  bytes auth_signing_key = 3;
+  bytes olm_ed25519_key = 4;
+  bytes olm_curve25519_key = 5;
+  bytes certificate_signature = 6;
+  bool revoked = 7;
+}
+
+message OneTimeKey {
+  string key_id = 1;
+  bytes curve25519_key = 2;
+  bytes signature = 3;
+}
+
+message PublishPreKeys { repeated OneTimeKey keys = 1; }
+message ClaimPreKey { string account_id = 1; string device_id = 2; }
+message PreKeyBundle { DeviceBundle device = 1; OneTimeKey one_time_key = 2; }
+
+message EncryptedEnvelope {
+  string envelope_id = 1;
+  string logical_message_id = 2;
+  string conversation_id = 3;
+  string recipient_account_id = 4;
+  string recipient_device_id = 5;
+  bytes ciphertext = 6;
+  uint32 olm_message_type = 7;
+  int64 client_sent_at_ms = 8;
+}
+
+message SendEnvelopes { repeated EncryptedEnvelope envelopes = 1; }
+message SendAccepted { string logical_message_id = 1; int64 accepted_at_ms = 2; }
+message SyncRequest { uint64 after_cursor = 1; uint32 limit = 2; uint64 after_status_cursor = 3; }
+
+message StoredEnvelope {
+  uint64 cursor = 1;
+  string sender_account_id = 2;
+  string sender_device_id = 3;
+  EncryptedEnvelope envelope = 4;
+  int64 accepted_at_ms = 5;
+  string sender_username = 6;
+}
+
+message SyncBatch {
+  repeated StoredEnvelope envelopes = 1;
+  uint64 next_cursor = 2;
+  bool has_more = 3;
+  repeated StoredDeliveryUpdate delivery_updates = 4;
+  uint64 next_status_cursor = 5;
+}
+message AckEnvelope { string envelope_id = 1; uint64 cursor = 2; }
+message DeliveryUpdate { string logical_message_id = 1; int64 delivered_at_ms = 2; }
+message StoredDeliveryUpdate { uint64 cursor = 1; DeliveryUpdate update = 2; }
+
+message PairingRequest {
+  string pairing_id = 1;
+  string pending_device_id = 2;
+  string pending_device_name = 3;
+  bytes sas_public_key = 4;
+  DeviceBundle pending_device = 5;
+}
+
+message PairingEvent {
+  string pairing_id = 1;
+  string target_device_id = 2;
+  string event_type = 3;
+  bytes payload = 4;
+  string sender_device_id = 5;
+  uint64 server_event_id = 6;
+}
+
+message AckPairingEvent { uint64 server_event_id = 1; }
+
+message ActivateDevice {
+  string pairing_id = 1;
+  DeviceBundle device = 2;
+  uint64 roster_revision = 3;
+  bytes roster_signature = 4;
+}
+
+message Error { string code = 1; string message = 2; bool retryable = 3; }
+message Ping { int64 sent_at_ms = 1; }
+message Pong { int64 sent_at_ms = 1; }
+message OperationOk {}

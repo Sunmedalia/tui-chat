@@ -1,0 +1,76 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  dependencies:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@82eb9f621fbc699dd0918f3ea06864c14cc84246 # v2
+        with:
+          command: check
+
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.95.0
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all -- --check
+      - run: cargo test --workspace --locked
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+  binaries:
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            archive: tui-chat-linux-x86_64
+          - os: macos-13
+            target: x86_64-apple-darwin
+            archive: tui-chat-macos-x86_64
+          - os: macos-14
+            target: aarch64-apple-darwin
+            archive: tui-chat-macos-aarch64
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            archive: tui-chat-windows-x86_64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.95.0
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release --locked --target ${{ matrix.target }} -p tui-chat
+      - name: Package Unix
+        if: runner.os != 'Windows'
+        run: |
+          mkdir dist
+          cp target/${{ matrix.target }}/release/tui-chat dist/
+          tar -C dist -czf ${{ matrix.archive }}.tar.gz tui-chat
+          shasum -a 256 ${{ matrix.archive }}.tar.gz > ${{ matrix.archive }}.sha256
+      - name: Package Windows
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory dist
+          Copy-Item target/${{ matrix.target }}/release/tui-chat.exe dist/
+          Compress-Archive dist/tui-chat.exe ${{ matrix.archive }}.zip
+          (Get-FileHash ${{ matrix.archive }}.zip -Algorithm SHA256).Hash.ToLower() + "  ${{ matrix.archive }}.zip" | Out-File ${{ matrix.archive }}.sha256
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.archive }}
+          path: |
+            ${{ matrix.archive }}.*

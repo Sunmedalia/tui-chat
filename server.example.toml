@@ -1,0 +1,19 @@
+bind = "127.0.0.1:8080"
+database_path = "data/server.db"
+admin_socket_path = "data/admin.sock"
+public_domain = "chat.example.com"
+log_filter = "tui_chat_server=info"
+trusted_proxy_tls = false
+
+# 公网部署时由私有 Docker 网络中的 Caddy 传递 TLS 和客户端 IP。
+# 只有同时将 bind 改为非回环地址时才设置为 true。
+max_connections = 512
+max_connections_per_ip = 32
+max_unauthenticated_per_ip = 4
+auth_attempts_per_minute = 10
+auth_attempt_burst = 5
+auth_hash_concurrency = 4
+requests_per_minute = 120
+request_burst = 30
+audit_retention_days = 90
+pairing_ttl_seconds = 86400

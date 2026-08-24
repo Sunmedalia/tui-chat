@@ -1,0 +1,73 @@
+services:
+  server:
+    build: .
+    restart: unless-stopped
+    init: true
+    environment:
+      TUI_CHAT_BIND: 0.0.0.0:8080
+      TUI_CHAT_DATABASE_PATH: /data/server.db
+      TUI_CHAT_ADMIN_SOCKET_PATH: /data/admin.sock
+      TUI_CHAT_PUBLIC_DOMAIN: ${CHAT_DOMAIN:?set CHAT_DOMAIN}
+      TUI_CHAT_TRUSTED_PROXY_TLS: "true"
+      RUST_LOG: tui_chat_server=info
+    volumes:
+      - chat-data:/data
+    networks: [backend]
+    healthcheck:
+      test: ["CMD", "tui-chat-server", "healthcheck"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    security_opt: ["no-new-privileges:true"]
+    cap_drop: ["ALL"]
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+    pids_limit: 256
+    mem_limit: 512m
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"
+
+  caddy:
+    image: caddy:2.10-alpine
+    restart: unless-stopped
+    init: true
+    environment:
+      CHAT_DOMAIN: ${CHAT_DOMAIN:?set CHAT_DOMAIN}
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    networks: [frontend, backend]
+    depends_on:
+      server:
+        condition: service_healthy
+    security_opt: ["no-new-privileges:true"]
+    cap_drop: ["ALL"]
+    cap_add: ["NET_BIND_SERVICE"]
+    read_only: true
+    tmpfs:
+      - /tmp:size=32m,mode=1777
+    pids_limit: 256
+    mem_limit: 256m
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"
+
+networks:
+  frontend:
+  backend:
+    internal: true
+
+volumes:
+  chat-data:
+  caddy-data:
+  caddy-config:
