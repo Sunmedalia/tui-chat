@@ -426,6 +426,8 @@ tui-chat \
 
 本地运行时去掉下面命令中的 `docker compose exec server` 前缀即可。
 
+### 常用管理命令
+
 ```console
 # 列出账号
 docker compose exec server tui-chat-server user list
@@ -476,17 +478,39 @@ docker compose exec server tui-chat-server storage cleanup --yes
 
 `session list`、`conversation list` 和 `admin` 需要正在运行的服务端及其 Unix socket。纯数据库命令，例如 `user list`、`db check` 和 `db backup`，可直接读取配置的 SQLite 数据库。
 
-彻底删除账号会同时清理其设备、预密钥、会话密文、投递状态和配对事件。为防止误删，命令需要一份已存在的备份、`--yes` 以及交互输入用户名；省略 `--yes` 时只显示影响预览：
+### 永久删除用户
+
+彻底删除账号会同时清理该账号的设备、预密钥、会话密文、投递状态和配对事件，并立即断开该用户的在线连接。该操作不能通过客户端撤销；如果只是暂时禁止登录，请使用可恢复的 `user disable`。
+
+为防止误删，服务端要求依次完成一致性备份、影响预览、`--yes` 开关和交互式用户名确认。备份目标必须是尚不存在的新文件。以下示例删除 `alice`：
 
 ```console
-docker compose exec server tui-chat-server db backup /data/before-delete.db
+# 1. 创建删除前备份
+docker compose exec server tui-chat-server db backup /data/before-delete-alice.db
+
+# 可选：再把备份复制到宿主机保存
+docker compose cp server:/data/before-delete-alice.db ./before-delete-alice.db
+
+# 2. 只预览账号、设备和消息影响，不执行删除
 docker compose exec server tui-chat-server user delete alice \
-  --backup /data/before-delete.db
+  --backup /data/before-delete-alice.db
+
+# 3. 正式删除；出现提示后还需要手动输入 alice
 docker compose exec -it server tui-chat-server user delete alice \
-  --backup /data/before-delete.db --yes
+  --backup /data/before-delete-alice.db --yes
+
+# 4. 确认账号已不在列表中
+docker compose exec server tui-chat-server user list
 ```
 
-原有的 `user purge` 保留为兼容别名。
+正式删除时会显示 `Type alice to permanently delete this account:`；只有输入内容与用户名完全一致才会继续。原有的 `user purge` 保留为兼容别名。
+
+如果只需要暂停账号，应使用：
+
+```console
+docker compose exec server tui-chat-server user disable alice
+docker compose exec server tui-chat-server user enable alice
+```
 
 `reset-devices` 会开启新的账号身份代次。旧设备密钥和旧密文可能永久不可恢复，联系人也会把主密钥变化视为高危事件并停止发送。只有明确接受这一后果时才能使用。
 
