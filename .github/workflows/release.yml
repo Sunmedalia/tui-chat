@@ -1,0 +1,81 @@
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build-client:
+    name: Build ${{ matrix.archive }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            archive: tui-chat-linux-x86_64
+          - os: macos-13
+            target: x86_64-apple-darwin
+            archive: tui-chat-macos-x86_64
+          - os: macos-14
+            target: aarch64-apple-darwin
+            archive: tui-chat-macos-aarch64
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            archive: tui-chat-windows-x86_64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.95.0
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release --locked --target ${{ matrix.target }} -p tui-chat
+      - name: Package Unix client
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir dist
+          cp "target/${{ matrix.target }}/release/tui-chat" dist/
+          tar -C dist -czf "${{ matrix.archive }}.tar.gz" tui-chat
+          shasum -a 256 "${{ matrix.archive }}.tar.gz" > "${{ matrix.archive }}.sha256"
+      - name: Package Windows client
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory dist
+          Copy-Item "target/${{ matrix.target }}/release/tui-chat.exe" dist/tui-chat.exe
+          Compress-Archive dist/tui-chat.exe "${{ matrix.archive }}.zip"
+          (Get-FileHash "${{ matrix.archive }}.zip" -Algorithm SHA256).Hash.ToLower() + "  ${{ matrix.archive }}.zip" | Out-File "${{ matrix.archive }}.sha256"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.archive }}
+          path: |
+            ${{ matrix.archive }}.*
+
+  publish:
+    name: Publish GitHub Release
+    needs: build-client
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: tui-chat-*
+          path: dist
+          merge-multiple: true
+      - name: Publish release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh release create "${GITHUB_REF_NAME}" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --title "${GITHUB_REF_NAME}" \
+            --generate-notes \
+            dist/*

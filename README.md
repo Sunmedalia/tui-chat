@@ -64,6 +64,8 @@ target/release/tui-chat-server
 target/release/tui-chat
 ```
 
+本地客户端和普通 `cargo` 命令默认使用 crates.io。只有服务端 Docker 构建会加载 `docker/cargo-rsproxy.toml`，通过 rsproxy 下载 Rust 依赖；两者不会互相影响。
+
 ## 本地快速开始
 
 以下示例在本机启动服务端，并创建 Alice 和 Bob 两个客户端。
@@ -506,6 +508,15 @@ cargo build --release --locked -p tui-chat-server -p tui-chat
 ```
 
 CI 还会执行依赖许可证、来源和安全公告策略检查，并为 Linux、macOS 和 Windows 构建客户端产物。
+
+## 发布客户端
+
+推送版本标签后，GitHub Actions 会构建并发布 Linux x86_64、macOS Intel、macOS Apple Silicon 和 Windows x86_64 客户端压缩包，同时生成 SHA-256 校验文件：
+
+```console
+git tag v0.1.0
+git push origin v0.1.0
+```
 
 ## 当前限制
 
