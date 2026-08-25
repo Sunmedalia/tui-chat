@@ -517,10 +517,16 @@ pub async fn list_audit(db: &Db, limit: u32, output: OutputFormat) -> Result<()>
     Ok(())
 }
 
-pub async fn purge_user(db: &Db, username: &str, backup: &Path, yes: bool) -> Result<()> {
+pub async fn delete_user(
+    db: &Db,
+    admin_socket: &Path,
+    username: &str,
+    backup: &Path,
+    yes: bool,
+) -> Result<()> {
     let username = normalize_username(username)?;
     if !backup.is_file() {
-        bail!("an existing database backup file is required before purge");
+        bail!("an existing database backup file is required before deletion");
     }
     let account_id: Option<String> =
         sqlx::query_scalar("SELECT id FROM accounts WHERE username = ? COLLATE NOCASE")
@@ -541,46 +547,24 @@ pub async fn purge_user(db: &Db, username: &str, backup: &Path, yes: bool) -> Re
     .bind(&account_id)
     .fetch_one(db.pool())
     .await?;
-    println!("purge preview: user={username} devices={devices} logical_messages={messages}");
+    println!("delete preview: user={username} devices={devices} logical_messages={messages}");
     if !yes {
         println!("dry-run only; repeat with --yes and type the username to confirm");
         return Ok(());
     }
-    print!("Type {username} to permanently purge this account: ");
+    print!("Type {username} to permanently delete this account: ");
     std::io::stdout().flush()?;
     let mut confirmation = String::new();
     std::io::stdin().read_line(&mut confirmation)?;
     if confirmation.trim() != username {
-        bail!("purge confirmation did not match");
+        bail!("delete confirmation did not match");
     }
-    let mut tx = db.pool().begin().await?;
-    sqlx::query("DELETE FROM pairing_events WHERE sender_device_id IN (SELECT id FROM devices WHERE account_id = ?) OR target_device_id IN (SELECT id FROM devices WHERE account_id = ?)").bind(&account_id).bind(&account_id).execute(&mut *tx).await?;
-    sqlx::query("DELETE FROM delivery_updates WHERE account_id = ? OR logical_message_id IN (SELECT logical_message_id FROM logical_messages WHERE sender_account_id = ? OR peer_account_id = ?)").bind(&account_id).bind(&account_id).bind(&account_id).execute(&mut *tx).await?;
-    sqlx::query("DELETE FROM envelopes WHERE sender_account_id = ? OR recipient_account_id = ? OR logical_message_id IN (SELECT logical_message_id FROM logical_messages WHERE sender_account_id = ? OR peer_account_id = ?)").bind(&account_id).bind(&account_id).bind(&account_id).bind(&account_id).execute(&mut *tx).await?;
-    sqlx::query("DELETE FROM logical_messages WHERE sender_account_id = ? OR peer_account_id = ?")
-        .bind(&account_id)
-        .bind(&account_id)
-        .execute(&mut *tx)
-        .await?;
-    sqlx::query(
-        "DELETE FROM prekeys WHERE device_id IN (SELECT id FROM devices WHERE account_id = ?)",
-    )
-    .bind(&account_id)
-    .execute(&mut *tx)
-    .await?;
-    sqlx::query("DELETE FROM devices WHERE account_id = ?")
-        .bind(&account_id)
-        .execute(&mut *tx)
-        .await?;
-    sqlx::query("DELETE FROM accounts WHERE id = ?")
-        .bind(&account_id)
-        .execute(&mut *tx)
-        .await?;
-    tx.commit().await?;
+    disconnect_user_if_online(db, admin_socket, &username, "account_deleted").await?;
+    delete_user_records(db, &account_id).await?;
     db.audit(
         "admin",
         "local-admin",
-        "user_purge",
+        "user_delete",
         &username,
         "success",
         (
@@ -589,6 +573,139 @@ pub async fn purge_user(db: &Db, username: &str, backup: &Path, yes: bool) -> Re
         ),
     )
     .await?;
-    println!("purged account {username}");
+    println!("deleted account {username}");
     Ok(())
+}
+
+async fn delete_user_records(db: &Db, account_id: &str) -> Result<()> {
+    let mut tx = db.pool().begin().await?;
+    sqlx::query(
+        "DELETE FROM pairing_events
+         WHERE sender_device_id IN (SELECT id FROM devices WHERE account_id = ?)
+            OR target_device_id IN (SELECT id FROM devices WHERE account_id = ?)",
+    )
+    .bind(account_id)
+    .bind(account_id)
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query(
+        "DELETE FROM delivery_updates
+         WHERE account_id = ?
+            OR logical_message_id IN (
+                SELECT logical_message_id FROM logical_messages
+                WHERE sender_account_id = ? OR peer_account_id = ?
+            )",
+    )
+    .bind(account_id)
+    .bind(account_id)
+    .bind(account_id)
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query(
+        "DELETE FROM envelopes
+         WHERE sender_account_id = ? OR recipient_account_id = ?
+            OR logical_message_id IN (
+                SELECT logical_message_id FROM logical_messages
+                WHERE sender_account_id = ? OR peer_account_id = ?
+            )",
+    )
+    .bind(account_id)
+    .bind(account_id)
+    .bind(account_id)
+    .bind(account_id)
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query("DELETE FROM logical_messages WHERE sender_account_id = ? OR peer_account_id = ?")
+        .bind(account_id)
+        .bind(account_id)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query(
+        "DELETE FROM prekeys WHERE device_id IN (SELECT id FROM devices WHERE account_id = ?)",
+    )
+    .bind(account_id)
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query("DELETE FROM devices WHERE account_id = ?")
+        .bind(account_id)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("DELETE FROM accounts WHERE id = ?")
+        .bind(account_id)
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn deleting_user_removes_related_data_but_keeps_other_account() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let db = Db::connect(&directory.path().join("server.db")).await?;
+        for (id, username) in [("account-a", "alice"), ("account-b", "bob")] {
+            sqlx::query("INSERT INTO accounts(id, username, password_phc, created_at_ms) VALUES(?, ?, 'hash', 1)")
+                .bind(id)
+                .bind(username)
+                .execute(db.pool())
+                .await?;
+        }
+        for (id, account_id) in [("device-a", "account-a"), ("device-b", "account-b")] {
+            sqlx::query("INSERT INTO devices(id, account_id, name, auth_signing_key, olm_ed25519_key, olm_curve25519_key, certificate_signature, created_at_ms) VALUES(?, ?, 'test', X'01', X'02', X'03', X'04', 1)")
+                .bind(id)
+                .bind(account_id)
+                .execute(db.pool())
+                .await?;
+        }
+        sqlx::query("INSERT INTO prekeys(device_id, key_id, curve25519_key, signature, created_at_ms) VALUES('device-a', 'key-a', X'05', X'06', 1)")
+            .execute(db.pool())
+            .await?;
+        sqlx::query("INSERT INTO logical_messages(logical_message_id, sender_account_id, sender_device_id, peer_account_id, conversation_id, client_sent_at_ms, accepted_at_ms) VALUES('message-a', 'account-a', 'device-a', 'account-b', 'conversation-a-b', 1, 1)")
+            .execute(db.pool())
+            .await?;
+        sqlx::query("INSERT INTO envelopes(envelope_id, logical_message_id, sender_account_id, sender_device_id, recipient_account_id, recipient_device_id, conversation_id, ciphertext, olm_message_type, client_sent_at_ms, accepted_at_ms) VALUES('envelope-a', 'message-a', 'account-a', 'device-a', 'account-b', 'device-b', 'conversation-a-b', X'07', 0, 1, 1)")
+            .execute(db.pool())
+            .await?;
+        sqlx::query("INSERT INTO delivery_updates(account_id, logical_message_id, delivered_at_ms) VALUES('account-a', 'message-a', 1)")
+            .execute(db.pool())
+            .await?;
+        sqlx::query("INSERT INTO pairing_events(pairing_id, sender_device_id, target_device_id, event_type, payload, created_at_ms) VALUES('pairing-a', 'device-a', 'device-b', 'request', X'08', 1)")
+            .execute(db.pool())
+            .await?;
+
+        delete_user_records(&db, "account-a").await?;
+
+        let alice: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM accounts WHERE id = 'account-a'")
+            .fetch_one(db.pool())
+            .await?;
+        let bob: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM accounts WHERE id = 'account-b'")
+            .fetch_one(db.pool())
+            .await?;
+        assert_eq!(alice, 0);
+        assert_eq!(bob, 1);
+        for table in [
+            "devices",
+            "prekeys",
+            "logical_messages",
+            "envelopes",
+            "delivery_updates",
+            "pairing_events",
+        ] {
+            let count: i64 = sqlx::query_scalar(&format!("SELECT COUNT(*) FROM {table}"))
+                .fetch_one(db.pool())
+                .await?;
+            if table == "devices" {
+                assert_eq!(count, 1, "the other account's device should remain");
+            } else {
+                assert_eq!(
+                    count, 0,
+                    "{table} should no longer reference the deleted account"
+                );
+            }
+        }
+        Ok(())
+    }
 }

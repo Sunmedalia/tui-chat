@@ -82,6 +82,18 @@ enum UserCommand {
     ResetDevices {
         username: String,
     },
+    /// Permanently delete an account and all server-side data associated with it.
+    Delete {
+        username: String,
+        /// Path to an existing database backup created before deletion.
+        #[arg(long)]
+        backup: PathBuf,
+        /// Execute the deletion after showing its impact (still requires typed confirmation).
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Backwards-compatible alias for `user delete`.
+    #[command(hide = true)]
     Purge {
         username: String,
         #[arg(long)]
@@ -183,22 +195,16 @@ async fn main() -> Result<()> {
                 )
                 .await
             }
-            UserCommand::Purge {
+            UserCommand::Delete {
                 username,
                 backup,
                 yes,
-            } => {
-                if yes {
-                    admin::disconnect_user_if_online(
-                        &db,
-                        &config.admin_socket_path,
-                        &username,
-                        "account_purged",
-                    )
-                    .await?;
-                }
-                admin::purge_user(&db, &username, &backup, yes).await
             }
+            | UserCommand::Purge {
+                username,
+                backup,
+                yes,
+            } => admin::delete_user(&db, &config.admin_socket_path, &username, &backup, yes).await,
         },
         Command::Device { command } => match command {
             DeviceCommand::List { username } => admin::list_devices(&db, &username, output).await,

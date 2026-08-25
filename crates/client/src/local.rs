@@ -151,6 +151,114 @@ pub struct TransferContact {
     pub verified: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum NotificationKind {
+    Pairing,
+    ChatRequest,
+    ChatResponse,
+}
+
+impl NotificationKind {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Pairing => "pairing",
+            Self::ChatRequest => "chat_request",
+            Self::ChatResponse => "chat_response",
+        }
+    }
+}
+
+impl TryFrom<&str> for NotificationKind {
+    type Error = anyhow::Error;
+
+    fn try_from(value: &str) -> Result<Self> {
+        match value {
+            "pairing" => Ok(Self::Pairing),
+            "chat_request" => Ok(Self::ChatRequest),
+            "chat_response" => Ok(Self::ChatResponse),
+            _ => anyhow::bail!("unknown notification kind"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum NotificationState {
+    Pending,
+    InProgress,
+    Accepted,
+    Rejected,
+    Completed,
+    Failed,
+}
+
+impl NotificationState {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::InProgress => "in_progress",
+            Self::Accepted => "accepted",
+            Self::Rejected => "rejected",
+            Self::Completed => "completed",
+            Self::Failed => "failed",
+        }
+    }
+}
+
+impl TryFrom<&str> for NotificationState {
+    type Error = anyhow::Error;
+
+    fn try_from(value: &str) -> Result<Self> {
+        match value {
+            "pending" => Ok(Self::Pending),
+            "in_progress" => Ok(Self::InProgress),
+            "accepted" => Ok(Self::Accepted),
+            "rejected" => Ok(Self::Rejected),
+            "completed" => Ok(Self::Completed),
+            "failed" => Ok(Self::Failed),
+            _ => anyhow::bail!("unknown notification state"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum NotificationData {
+    Pairing {
+        pairing_id: String,
+        pending_device_id: String,
+        pending_device_name: String,
+        sas_public_key: Vec<u8>,
+        pending_device: Vec<u8>,
+    },
+    ChatRequest {
+        #[serde(default)]
+        outgoing: bool,
+        request_id: String,
+        sender_account_id: String,
+        sender_username: String,
+        sender_device_id: String,
+        sender_bundle: Vec<u8>,
+    },
+    ChatResponse {
+        request_id: String,
+        accepted: bool,
+    },
+}
+
+#[derive(Debug, Clone)]
+pub struct Notification {
+    pub id: String,
+    pub kind: NotificationKind,
+    pub request_id: String,
+    pub actor_account_id: String,
+    pub actor_username: String,
+    pub actor_device_id: String,
+    pub state: NotificationState,
+    pub read: bool,
+    pub created_at_ms: i64,
+    pub updated_at_ms: i64,
+    pub data: NotificationData,
+}
+
 impl LocalStore {
     pub async fn open(path: &Path) -> Result<Self> {
         if let Some(parent) = path.parent() {
@@ -386,6 +494,65 @@ impl LocalStore {
         Ok(())
     }
 
+    pub async fn commit_unverified_inbound(
+        &self,
+        vault: &VaultSession,
+        profile: &RuntimeProfile,
+        message: &ChatMessage,
+        notification: &Notification,
+        cursor: u64,
+    ) -> Result<()> {
+        let profile_blob = encode_profile(vault, profile)?;
+        let body = encode_message(vault, message)?;
+        let notification_payload = serde_json::to_vec(&notification.data)?;
+        let notification_aad = format!("notification/v1/{}", notification.id);
+        let encrypted_notification = vault
+            .encrypt(notification_aad.as_bytes(), &notification_payload)?
+            .to_bytes();
+        let mut tx = self.pool.begin().await?;
+        sqlx::query("INSERT INTO profile(singleton, encrypted_blob, updated_at_ms, encryption_version) VALUES(1, ?, ?, 2) ON CONFLICT(singleton) DO UPDATE SET encrypted_blob=excluded.encrypted_blob, updated_at_ms=excluded.updated_at_ms, encryption_version=2")
+            .bind(profile_blob).bind(now_ms()).execute(&mut *tx).await?;
+        sqlx::query("INSERT OR IGNORE INTO messages(logical_message_id, conversation_id, peer_account_id, sender_account_id, encrypted_body, sent_at_ms, status, inbound, encryption_version) VALUES(?, ?, ?, ?, ?, ?, ?, ?, 2)")
+            .bind(&message.id).bind(&message.conversation_id).bind(&message.peer_account_id).bind(&message.sender_account_id)
+            .bind(body).bind(message.sent_at_ms).bind(message.status.as_str()).bind(i64::from(message.inbound)).execute(&mut *tx).await?;
+        sqlx::query(
+            "INSERT INTO notifications(
+                id, kind, request_id, actor_account_id, actor_username, actor_device_id,
+                encrypted_payload, state, is_read, created_at_ms, updated_at_ms
+             ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             ON CONFLICT(request_id) DO UPDATE SET
+                id=excluded.id,
+                kind=excluded.kind,
+                actor_account_id=excluded.actor_account_id,
+                actor_username=excluded.actor_username,
+                actor_device_id=excluded.actor_device_id,
+                encrypted_payload=excluded.encrypted_payload,
+                state=excluded.state,
+                is_read=excluded.is_read,
+                created_at_ms=excluded.created_at_ms,
+                updated_at_ms=excluded.updated_at_ms",
+        )
+        .bind(&notification.id)
+        .bind(notification.kind.as_str())
+        .bind(&notification.request_id)
+        .bind(&notification.actor_account_id)
+        .bind(&notification.actor_username)
+        .bind(&notification.actor_device_id)
+        .bind(encrypted_notification)
+        .bind(notification.state.as_str())
+        .bind(i64::from(notification.read))
+        .bind(notification.created_at_ms)
+        .bind(notification.updated_at_ms)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query("UPDATE sync_state SET envelope_cursor = ? WHERE singleton = 1")
+            .bind(cursor as i64)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
     pub async fn commit_control(
         &self,
         vault: &VaultSession,
@@ -431,6 +598,47 @@ impl LocalStore {
         .fetch_all(&self.pool)
         .await?;
         rows.into_iter().map(contact_from_row).collect()
+    }
+
+    pub async fn delete_conversation(
+        &self,
+        peer_account_id: &str,
+        conversation_id: &str,
+    ) -> Result<()> {
+        let mut tx = self.pool.begin().await?;
+        sqlx::query(
+            "DELETE FROM outbox WHERE logical_message_id IN (
+                SELECT logical_message_id FROM messages WHERE conversation_id = ?
+             )",
+        )
+        .bind(conversation_id)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query("DELETE FROM messages WHERE conversation_id = ?")
+            .bind(conversation_id)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("DELETE FROM drafts WHERE conversation_id = ?")
+            .bind(conversation_id)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("DELETE FROM conversation_summaries WHERE conversation_id = ?")
+            .bind(conversation_id)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query(
+            "DELETE FROM notifications
+             WHERE actor_account_id = ? AND kind IN ('chat_request', 'chat_response')",
+        )
+        .bind(peer_account_id)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query("DELETE FROM contacts WHERE account_id = ?")
+            .bind(peer_account_id)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(())
     }
 
     pub async fn export_contacts(&self) -> Result<Vec<TransferContact>> {
@@ -679,6 +887,110 @@ impl LocalStore {
         Ok(())
     }
 
+    pub async fn notifications(&self, vault: &VaultSession) -> Result<Vec<Notification>> {
+        let rows = sqlx::query(
+            "SELECT id, kind, request_id, actor_account_id, actor_username, actor_device_id,
+                    encrypted_payload, state, is_read, created_at_ms, updated_at_ms
+             FROM notifications ORDER BY created_at_ms DESC, id DESC LIMIT 200",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter()
+            .map(|row| decode_notification(vault, row))
+            .collect()
+    }
+
+    pub async fn notification_by_request_id(
+        &self,
+        vault: &VaultSession,
+        request_id: &str,
+    ) -> Result<Option<Notification>> {
+        let row = sqlx::query(
+            "SELECT id, kind, request_id, actor_account_id, actor_username, actor_device_id,
+                    encrypted_payload, state, is_read, created_at_ms, updated_at_ms
+             FROM notifications WHERE request_id = ?",
+        )
+        .bind(request_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        row.map(|row| decode_notification(vault, row)).transpose()
+    }
+
+    pub async fn save_notification(
+        &self,
+        vault: &VaultSession,
+        notification: &Notification,
+    ) -> Result<()> {
+        let payload = serde_json::to_vec(&notification.data)?;
+        let aad = format!("notification/v1/{}", notification.id);
+        let encrypted_payload = vault.encrypt(aad.as_bytes(), &payload)?.to_bytes();
+        sqlx::query(
+            "INSERT INTO notifications(
+                id, kind, request_id, actor_account_id, actor_username, actor_device_id,
+                encrypted_payload, state, is_read, created_at_ms, updated_at_ms
+             ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             ON CONFLICT(request_id) DO UPDATE SET
+                id=excluded.id,
+                kind=excluded.kind,
+                actor_account_id=excluded.actor_account_id,
+                actor_username=excluded.actor_username,
+                actor_device_id=excluded.actor_device_id,
+                encrypted_payload=excluded.encrypted_payload,
+                state=excluded.state,
+                is_read=excluded.is_read,
+                updated_at_ms=excluded.updated_at_ms",
+        )
+        .bind(&notification.id)
+        .bind(notification.kind.as_str())
+        .bind(&notification.request_id)
+        .bind(&notification.actor_account_id)
+        .bind(&notification.actor_username)
+        .bind(&notification.actor_device_id)
+        .bind(encrypted_payload)
+        .bind(notification.state.as_str())
+        .bind(i64::from(notification.read))
+        .bind(notification.created_at_ms)
+        .bind(notification.updated_at_ms)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn update_notification_state(
+        &self,
+        id: &str,
+        state: NotificationState,
+        read: bool,
+    ) -> Result<()> {
+        sqlx::query(
+            "UPDATE notifications SET state = ?, is_read = ?, updated_at_ms = ? WHERE id = ?",
+        )
+        .bind(state.as_str())
+        .bind(i64::from(read))
+        .bind(now_ms())
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn mark_notification_read(&self, id: &str) -> Result<()> {
+        sqlx::query("UPDATE notifications SET is_read = 1, updated_at_ms = ? WHERE id = ?")
+            .bind(now_ms())
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn delete_notification(&self, id: &str) -> Result<()> {
+        sqlx::query("DELETE FROM notifications WHERE id = ?")
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
     pub async fn pairing_event_processed(&self, server_event_id: u64) -> Result<bool> {
         Ok(sqlx::query_scalar::<_, i64>(
             "SELECT COUNT(*) FROM processed_pairing_events WHERE server_event_id = ?",
@@ -706,6 +1018,26 @@ fn contact_from_row(row: sqlx::sqlite::SqliteRow) -> Result<Contact> {
         identity_changed: row.get::<i64, _>("identity_changed") != 0,
         unread_count: row.get::<i64, _>("unread_count") as u64,
         last_activity_ms: row.get("last_activity_ms"),
+    })
+}
+
+fn decode_notification(vault: &VaultSession, row: sqlx::sqlite::SqliteRow) -> Result<Notification> {
+    let id: String = row.get("id");
+    let blob = decode_encrypted_blob(&row.get::<Vec<u8>, _>("encrypted_payload"))?;
+    let aad = format!("notification/v1/{id}");
+    let data = serde_json::from_slice(&vault.decrypt(aad.as_bytes(), &blob)?)?;
+    Ok(Notification {
+        id,
+        kind: NotificationKind::try_from(row.get::<String, _>("kind").as_str())?,
+        request_id: row.get("request_id"),
+        actor_account_id: row.get("actor_account_id"),
+        actor_username: row.get("actor_username"),
+        actor_device_id: row.get("actor_device_id"),
+        state: NotificationState::try_from(row.get::<String, _>("state").as_str())?,
+        read: row.get::<i64, _>("is_read") != 0,
+        created_at_ms: row.get("created_at_ms"),
+        updated_at_ms: row.get("updated_at_ms"),
+        data,
     })
 }
 
@@ -780,6 +1112,285 @@ mod tests {
         .fetch_one(&store.pool)
         .await?;
         assert_eq!(status, "read");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn notifications_are_encrypted_deduplicated_and_persisted() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let store = LocalStore::open(&directory.path().join("client.db")).await?;
+        let vault = store.unlock("test passphrase").await?;
+        let notification = Notification {
+            id: "notification-1".into(),
+            kind: NotificationKind::ChatRequest,
+            request_id: "request-1".into(),
+            actor_account_id: "account-a".into(),
+            actor_username: "alice".into(),
+            actor_device_id: "device-a".into(),
+            state: NotificationState::Pending,
+            read: false,
+            created_at_ms: 1,
+            updated_at_ms: 1,
+            data: NotificationData::ChatRequest {
+                outgoing: false,
+                request_id: "request-1".into(),
+                sender_account_id: "account-a".into(),
+                sender_username: "alice".into(),
+                sender_device_id: "device-a".into(),
+                sender_bundle: bundle("account-a", "alice").encode_to_vec(),
+            },
+        };
+        store.save_notification(&vault, &notification).await?;
+        let raw: Vec<u8> = sqlx::query_scalar(
+            "SELECT encrypted_payload FROM notifications WHERE request_id = 'request-1'",
+        )
+        .fetch_one(&store.pool)
+        .await?;
+        assert!(!raw.windows(b"alice".len()).any(|window| window == b"alice"));
+        store
+            .update_notification_state("notification-1", NotificationState::Accepted, true)
+            .await?;
+        let notifications = store.notifications(&vault).await?;
+        assert_eq!(notifications.len(), 1);
+        assert_eq!(notifications[0].state, NotificationState::Accepted);
+        assert!(notifications[0].read);
+
+        let response = Notification {
+            id: "notification-1".into(),
+            kind: NotificationKind::ChatResponse,
+            request_id: "request-1".into(),
+            actor_account_id: "account-a".into(),
+            actor_username: "alice".into(),
+            actor_device_id: "device-a".into(),
+            state: NotificationState::Rejected,
+            read: true,
+            created_at_ms: 1,
+            updated_at_ms: 2,
+            data: NotificationData::ChatResponse {
+                request_id: "request-1".into(),
+                accepted: false,
+            },
+        };
+        store.save_notification(&vault, &response).await?;
+        let notifications = store.notifications(&vault).await?;
+        assert_eq!(notifications.len(), 1);
+        assert_eq!(notifications[0].kind, NotificationKind::ChatResponse);
+        assert_eq!(notifications[0].state, NotificationState::Rejected);
+        assert!(matches!(
+            notifications[0].data,
+            NotificationData::ChatResponse {
+                accepted: false,
+                ..
+            }
+        ));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn notifications_keep_time_order_when_read_and_can_be_deleted() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let store = LocalStore::open(&directory.path().join("client.db")).await?;
+        let vault = store.unlock("test passphrase").await?;
+        for (id, request_id, created_at_ms) in [
+            ("notification-old", "request-old", 10),
+            ("notification-new", "request-new", 20),
+        ] {
+            store
+                .save_notification(
+                    &vault,
+                    &Notification {
+                        id: id.into(),
+                        kind: NotificationKind::ChatRequest,
+                        request_id: request_id.into(),
+                        actor_account_id: "account-a".into(),
+                        actor_username: "alice".into(),
+                        actor_device_id: "device-a".into(),
+                        state: NotificationState::Pending,
+                        read: false,
+                        created_at_ms,
+                        updated_at_ms: created_at_ms,
+                        data: NotificationData::ChatRequest {
+                            outgoing: false,
+                            request_id: request_id.into(),
+                            sender_account_id: "account-a".into(),
+                            sender_username: "alice".into(),
+                            sender_device_id: "device-a".into(),
+                            sender_bundle: bundle("account-a", "alice").encode_to_vec(),
+                        },
+                    },
+                )
+                .await?;
+        }
+
+        store.mark_notification_read("notification-old").await?;
+        let notifications = store.notifications(&vault).await?;
+        assert_eq!(notifications[0].id, "notification-new");
+        assert_eq!(notifications[1].id, "notification-old");
+
+        store.delete_notification("notification-new").await?;
+        let notifications = store.notifications(&vault).await?;
+        assert_eq!(notifications.len(), 1);
+        assert_eq!(notifications[0].id, "notification-old");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn quarantined_message_notification_and_cursor_are_committed_together() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let store = LocalStore::open(&directory.path().join("client.db")).await?;
+        let vault = store.unlock("test passphrase").await?;
+        let identity = DeviceIdentity::new("account-local", "device-local", "test", true);
+        let profile = RuntimeProfile {
+            account_master_public: identity
+                .master_public_key()
+                .expect("first device has a master key")
+                .to_vec(),
+            username: "local-user".into(),
+            account_id: "account-local".into(),
+            server_url: "ws://127.0.0.1:8080/v1/ws".into(),
+            identity,
+            machine: OlmMachine::new(),
+            pending: false,
+            pairing_secret: None,
+            spki_pin: None,
+        };
+        let peer = bundle("account-a", "alice");
+        store.upsert_contact(&peer).await?;
+        let message = ChatMessage {
+            id: "message-1".into(),
+            conversation_id: "conversation-1".into(),
+            peer_account_id: "account-a".into(),
+            sender_account_id: "account-a".into(),
+            body: "quarantined secret".into(),
+            sent_at_ms: 10,
+            status: MessageStatus::Delivered,
+            inbound: true,
+        };
+        let notification = Notification {
+            id: "notification-1".into(),
+            kind: NotificationKind::ChatRequest,
+            request_id: "reauth-conversation-1".into(),
+            actor_account_id: "account-a".into(),
+            actor_username: "alice".into(),
+            actor_device_id: "device-a".into(),
+            state: NotificationState::Pending,
+            read: false,
+            created_at_ms: 10,
+            updated_at_ms: 10,
+            data: NotificationData::ChatRequest {
+                outgoing: false,
+                request_id: "reauth-conversation-1".into(),
+                sender_account_id: "account-a".into(),
+                sender_username: "alice".into(),
+                sender_device_id: "device-a".into(),
+                sender_bundle: peer.encode_to_vec(),
+            },
+        };
+
+        store
+            .commit_unverified_inbound(&vault, &profile, &message, &notification, 7)
+            .await?;
+
+        assert!(store.load_profile(&vault).await?.is_some());
+        assert_eq!(
+            store.messages(&vault, "conversation-1").await?[0].body,
+            "quarantined secret"
+        );
+        assert_eq!(store.notifications(&vault).await?.len(), 1);
+        assert_eq!(store.cursors().await?, (7, 0));
+
+        store
+            .update_notification_state("notification-1", NotificationState::Rejected, true)
+            .await?;
+        let mut retry_message = message.clone();
+        retry_message.id = "message-2".into();
+        let mut retry_notification = notification;
+        retry_notification.state = NotificationState::Pending;
+        retry_notification.read = false;
+        retry_notification.updated_at_ms = 20;
+        store
+            .commit_unverified_inbound(&vault, &profile, &retry_message, &retry_notification, 8)
+            .await?;
+        let notifications = store.notifications(&vault).await?;
+        assert_eq!(notifications.len(), 1);
+        assert_eq!(notifications[0].state, NotificationState::Pending);
+        assert!(!notifications[0].read);
+        assert_eq!(store.messages(&vault, "conversation-1").await?.len(), 2);
+        assert_eq!(store.cursors().await?, (8, 0));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn deleting_a_conversation_removes_all_local_conversation_state() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let store = LocalStore::open(&directory.path().join("client.db")).await?;
+        let vault = store.unlock("test passphrase").await?;
+        let peer = bundle("account-a", "alice");
+        store.upsert_contact(&peer).await?;
+        store
+            .save_message(
+                &vault,
+                &ChatMessage {
+                    id: "message-1".into(),
+                    conversation_id: "conversation-1".into(),
+                    peer_account_id: "account-a".into(),
+                    sender_account_id: "account-local".into(),
+                    body: "secret".into(),
+                    sent_at_ms: 1,
+                    status: MessageStatus::Sending,
+                    inbound: false,
+                },
+            )
+            .await?;
+        store
+            .save_draft(&vault, "conversation-1", "unfinished")
+            .await?;
+        sqlx::query(
+            "INSERT INTO outbox(logical_message_id, encoded_frame, created_at_ms)
+             VALUES('message-1', X'01', 1)",
+        )
+        .execute(&store.pool)
+        .await?;
+        store
+            .save_notification(
+                &vault,
+                &Notification {
+                    id: "notification-1".into(),
+                    kind: NotificationKind::ChatRequest,
+                    request_id: "request-1".into(),
+                    actor_account_id: "account-a".into(),
+                    actor_username: "alice".into(),
+                    actor_device_id: "device-a".into(),
+                    state: NotificationState::Pending,
+                    read: false,
+                    created_at_ms: 1,
+                    updated_at_ms: 1,
+                    data: NotificationData::ChatRequest {
+                        outgoing: false,
+                        request_id: "request-1".into(),
+                        sender_account_id: "account-a".into(),
+                        sender_username: "alice".into(),
+                        sender_device_id: "device-a".into(),
+                        sender_bundle: peer.encode_to_vec(),
+                    },
+                },
+            )
+            .await?;
+
+        store
+            .delete_conversation("account-a", "conversation-1")
+            .await?;
+
+        assert!(store.contacts().await?.is_empty());
+        assert!(store.messages(&vault, "conversation-1").await?.is_empty());
+        assert_eq!(store.load_draft(&vault, "conversation-1").await?, "");
+        assert!(store.notifications(&vault).await?.is_empty());
+        for table in ["outbox", "conversation_summaries"] {
+            let count: i64 = sqlx::query_scalar(&format!("SELECT COUNT(*) FROM {table}"))
+                .fetch_one(&store.pool)
+                .await?;
+            assert_eq!(count, 0, "{table} should be empty");
+        }
         Ok(())
     }
 
