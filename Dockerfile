@@ -1,4 +1,7 @@
-FROM rust:1.95.0-bookworm AS builder
+ARG RUST_BASE=rust:1.95.0-bookworm
+ARG RUNTIME_BASE=debian:bookworm-slim
+
+FROM ${RUST_BASE} AS builder
 WORKDIR /build
 COPY . .
 # Use rsproxy for Rust toolchain and crates.io traffic in restricted networks.
@@ -15,7 +18,7 @@ RUN case "$(uname -m)" in \
     && cargo "+${host_toolchain}" build --locked --release -p tui-chat-server \
     && strip /build/target/release/tui-chat-server
 
-FROM debian:bookworm-slim
+FROM ${RUNTIME_BASE}
 # The official Rust builder already contains the CA bundle. Copy it instead
 # of running apt-get in the runtime image; this keeps production builds
 # independent of the Debian mirror and its mutable signing-key state.

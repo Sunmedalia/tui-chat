@@ -1,6 +1,10 @@
 services:
   server:
-    build: .
+    build:
+      context: .
+      args:
+        RUST_BASE: ${TUI_CHAT_RUST_BASE:-rust:1.95.0-bookworm}
+        RUNTIME_BASE: ${TUI_CHAT_RUNTIME_BASE:-debian:bookworm-slim}
     restart: unless-stopped
     init: true
     environment:
