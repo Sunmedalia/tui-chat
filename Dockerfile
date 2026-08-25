@@ -1,7 +1,8 @@
 FROM rust:1.95.0-bookworm AS builder
 WORKDIR /build
 COPY . .
-RUN cargo build --locked --release -p tui-chat-server \
+RUN host_toolchain="$(rustup show active-toolchain | awk '{print $1}')" \
+    && cargo "+${host_toolchain}" build --locked --release -p tui-chat-server \
     && strip /build/target/release/tui-chat-server
 
 FROM debian:bookworm-slim
