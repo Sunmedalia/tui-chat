@@ -1,6 +1,15 @@
 FROM rust:1.95.0-bookworm AS builder
 WORKDIR /build
 COPY . .
+# Use rsproxy for Rust toolchain and crates.io traffic in restricted networks.
+# Every value remains a build argument so deployments can override the mirror.
+ARG RUSTUP_DIST_SERVER=https://rsproxy.cn
+ARG RUSTUP_UPDATE_ROOT=https://rsproxy.cn/rustup/rustup
+ARG CARGO_REGISTRY_INDEX=sparse+https://rsproxy.cn/index/
+ENV RUSTUP_DIST_SERVER=${RUSTUP_DIST_SERVER} \
+    RUSTUP_UPDATE_ROOT=${RUSTUP_UPDATE_ROOT} \
+    CARGO_REGISTRIES_CRATES_IO_PROTOCOL=sparse \
+    CARGO_REGISTRIES_CRATES_IO_INDEX=${CARGO_REGISTRY_INDEX}
 RUN case "$(uname -m)" in \
         x86_64) host_toolchain="1.95.0-x86_64-unknown-linux-gnu" ;; \
         aarch64) host_toolchain="1.95.0-aarch64-unknown-linux-gnu" ;; \
