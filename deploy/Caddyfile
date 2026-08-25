@@ -1,11 +1,15 @@
 {$CHAT_DOMAIN} {
 	@chat_ws path /v2/ws
-	reverse_proxy @chat_ws server:8080 {
-		health_uri /healthz
-		health_interval 30s
+	handle @chat_ws {
+		reverse_proxy server:8080 {
+			health_uri /healthz
+			health_interval 30s
+		}
 	}
 
-	respond 404
+	handle {
+		respond 404
+	}
 
 	header {
 		Strict-Transport-Security "max-age=31536000; includeSubDomains"
