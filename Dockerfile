@@ -1,7 +1,11 @@
 FROM rust:1.95.0-bookworm AS builder
 WORKDIR /build
 COPY . .
-RUN host_toolchain="$(rustup show active-toolchain | awk '{print $1}')" \
+RUN case "$(uname -m)" in \
+        x86_64) host_toolchain="1.95.0-x86_64-unknown-linux-gnu" ;; \
+        aarch64) host_toolchain="1.95.0-aarch64-unknown-linux-gnu" ;; \
+        *) echo "unsupported build architecture: $(uname -m)" >&2; exit 1 ;; \
+    esac \
     && cargo "+${host_toolchain}" build --locked --release -p tui-chat-server \
     && strip /build/target/release/tui-chat-server
 
