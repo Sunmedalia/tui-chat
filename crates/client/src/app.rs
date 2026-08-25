@@ -100,6 +100,71 @@ enum SidebarTab {
     Notifications,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UiTheme {
+    Default,
+    Terminal,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ThemePalette {
+    primary: Color,
+    inbound: Color,
+    outbound: Color,
+    muted: Color,
+    text: Color,
+    success: Color,
+    danger: Color,
+    selection_foreground: Color,
+    selection_background: Color,
+}
+
+impl UiTheme {
+    const AVAILABLE: &'static str = "default、terminal";
+
+    const fn name(self) -> &'static str {
+        match self {
+            Self::Default => "default",
+            Self::Terminal => "terminal",
+        }
+    }
+
+    fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "default" | "classic" | "默认" => Some(Self::Default),
+            "terminal" | "shell" | "终端" => Some(Self::Terminal),
+            _ => None,
+        }
+    }
+
+    const fn palette(self) -> ThemePalette {
+        match self {
+            Self::Default => ThemePalette {
+                primary: Color::Cyan,
+                inbound: Color::Green,
+                outbound: Color::Cyan,
+                muted: Color::DarkGray,
+                text: Color::White,
+                success: Color::Green,
+                danger: Color::Red,
+                selection_foreground: Color::Black,
+                selection_background: Color::Cyan,
+            },
+            Self::Terminal => ThemePalette {
+                primary: Color::LightGreen,
+                inbound: Color::LightCyan,
+                outbound: Color::LightGreen,
+                muted: Color::DarkGray,
+                text: Color::Gray,
+                success: Color::LightGreen,
+                danger: Color::LightRed,
+                selection_foreground: Color::Black,
+                selection_background: Color::LightGreen,
+            },
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 struct EmojiEntry {
     glyph: &'static str,
@@ -528,7 +593,12 @@ impl Drop for TerminalSession {
 }
 
 impl UiLayout {
-    fn calculate(area: Rect, focus: FocusPane, editor_lines: usize) -> Self {
+    fn calculate(
+        area: Rect,
+        focus: FocusPane,
+        editor_lines: usize,
+        sidebar_collapsed: bool,
+    ) -> Self {
         let composer_height = (editor_lines as u16 + 2).clamp(3, 7);
         let outer = Layout::default()
             .direction(Direction::Vertical)
@@ -539,7 +609,9 @@ impl UiLayout {
             ])
             .split(area);
         let narrow = area.width < 72;
-        let (conversations, messages) = if narrow {
+        let (conversations, messages) = if sidebar_collapsed {
+            (Rect::default(), outer[0])
+        } else if narrow {
             if focus == FocusPane::Conversations {
                 (outer[0], Rect::default())
             } else {
@@ -585,6 +657,8 @@ pub struct App {
     editor: EditorState,
     focus: FocusPane,
     sidebar_tab: SidebarTab,
+    sidebar_collapsed: bool,
+    theme: UiTheme,
     completion: CompletionState,
     emoji_picker: EmojiPickerState,
     emoji_picker_area: Rect,
@@ -603,6 +677,7 @@ pub struct App {
     layout: UiLayout,
     conversation_tab_area: Rect,
     notification_tab_area: Rect,
+    sidebar_toggle_area: Rect,
     conversation_delete_areas: Vec<(usize, Rect)>,
     notification_delete_areas: Vec<(usize, Rect)>,
     delete_confirmation: Option<DeleteConfirmation>,
@@ -621,6 +696,7 @@ pub struct App {
     bundle_cache: HashMap<String, (UserBundle, Instant)>,
     reconnect_at: Instant,
     reconnect_backoff: u64,
+    post_activation_sync: bool,
 }
 
 impl App {
@@ -634,6 +710,14 @@ impl App {
     ) -> Result<Self> {
         let contacts = store.contacts().await?;
         let notifications = store.notifications(&vault).await?;
+        let theme = store
+            .ui_preference("theme")
+            .await?
+            .as_deref()
+            .and_then(UiTheme::parse)
+            .unwrap_or(UiTheme::Default);
+        let sidebar_collapsed =
+            store.ui_preference("sidebar_collapsed").await?.as_deref() == Some("true");
         let migration_store = store.clone();
         let migration_vault = vault.clone();
         tokio::spawn(async move {
@@ -653,6 +737,8 @@ impl App {
             editor: EditorState::new(),
             focus: FocusPane::Composer,
             sidebar_tab: SidebarTab::Conversations,
+            sidebar_collapsed,
+            theme,
             completion: CompletionState::default(),
             emoji_picker: EmojiPickerState::default(),
             emoji_picker_area: Rect::default(),
@@ -671,6 +757,7 @@ impl App {
             layout: UiLayout::default(),
             conversation_tab_area: Rect::default(),
             notification_tab_area: Rect::default(),
+            sidebar_toggle_area: Rect::default(),
             conversation_delete_areas: Vec::new(),
             notification_delete_areas: Vec::new(),
             delete_confirmation: None,
@@ -689,6 +776,7 @@ impl App {
             bundle_cache: HashMap::new(),
             reconnect_at: Instant::now(),
             reconnect_backoff: 1,
+            post_activation_sync: false,
         };
         app.restore_pairing_state_from_notifications()?;
         app.restore_pairing_requests_from_notifications();
@@ -1058,7 +1146,11 @@ impl App {
 
     async fn open_notification_tab(&mut self) -> Result<()> {
         self.sidebar_tab = SidebarTab::Notifications;
-        self.focus = FocusPane::Conversations;
+        self.focus = if self.sidebar_collapsed {
+            FocusPane::Messages
+        } else {
+            FocusPane::Conversations
+        };
         if self.notification_selected.is_none() && !self.notifications.is_empty() {
             self.notification_selected = Some(0);
         }
@@ -1339,6 +1431,14 @@ impl App {
             self.status = format!("草稿自动保存失败：{error:#}");
         }
         if self.connected {
+            if self.post_activation_sync {
+                self.post_activation_sync = false;
+                self.resend_outbox().await;
+                let _ = self.sync_pending_conversation_deletions().await;
+                if let Err(error) = self.sync().await {
+                    self.status = format!("设备已完成热切换，补拉离线消息失败：{error:#}");
+                }
+            }
             *heartbeat_counter = heartbeat_counter.wrapping_add(1);
             if heartbeat_counter.is_multiple_of(5) {
                 self.resend_outbox().await;
@@ -1361,6 +1461,7 @@ impl App {
     }
 
     fn draw(&mut self, frame: &mut ratatui::Frame<'_>) {
+        let palette = self.theme.palette();
         if frame.area().width < 32 || frame.area().height < 10 {
             frame.render_widget(
                 Paragraph::new("终端至少需要 32×10；Ctrl-C 仍可退出")
@@ -1378,10 +1479,16 @@ impl App {
             frame.area().width.saturating_sub(2).max(1),
         )
         .max(self.editor.line_count());
-        self.layout = UiLayout::calculate(frame.area(), self.focus, editor_lines);
+        self.layout = UiLayout::calculate(
+            frame.area(),
+            self.focus,
+            editor_lines,
+            self.sidebar_collapsed,
+        );
         let layout = self.layout;
         self.conversation_tab_area = Rect::default();
         self.notification_tab_area = Rect::default();
+        self.sidebar_toggle_area = sidebar_toggle_area(layout, self.sidebar_collapsed);
         self.conversation_delete_areas.clear();
         self.notification_delete_areas.clear();
         self.delete_confirm_area = Rect::default();
@@ -1443,8 +1550,8 @@ impl App {
                 };
                 let style = if Some(index) == self.selected {
                     Style::default()
-                        .fg(Color::Black)
-                        .bg(Color::Cyan)
+                        .fg(palette.selection_foreground)
+                        .bg(palette.selection_background)
                         .add_modifier(Modifier::BOLD)
                 } else {
                     Style::default()
@@ -1494,9 +1601,9 @@ impl App {
                         " 会话 ".to_owned()
                     },
                     Style::default().fg(if self.sidebar_tab == SidebarTab::Conversations {
-                        Color::Cyan
+                        palette.primary
                     } else {
-                        Color::DarkGray
+                        palette.muted
                     }),
                 ),
                 Span::raw("  "),
@@ -1507,9 +1614,9 @@ impl App {
                         format!(" {notification_label} ")
                     },
                     Style::default().fg(if self.sidebar_tab == SidebarTab::Notifications {
-                        Color::Cyan
+                        palette.primary
                     } else {
-                        Color::DarkGray
+                        palette.muted
                     }),
                 ),
             ]);
@@ -1521,8 +1628,11 @@ impl App {
                     "会话 · Alt-N 查看通知"
                 };
                 frame.render_widget(
-                    List::new(contacts)
-                        .block(focus_block(title, self.focus == FocusPane::Conversations)),
+                    List::new(contacts).block(focus_block(
+                        title,
+                        self.focus == FocusPane::Conversations,
+                        palette,
+                    )),
                     sidebar_body,
                 );
             } else {
@@ -1549,8 +1659,8 @@ impl App {
                         let unread = if notification.read { "" } else { " ●" };
                         let style = if Some(index) == self.notification_selected {
                             Style::default()
-                                .fg(Color::Black)
-                                .bg(Color::Cyan)
+                                .fg(palette.selection_foreground)
+                                .bg(palette.selection_background)
                                 .add_modifier(Modifier::BOLD)
                         } else {
                             Style::default()
@@ -1567,6 +1677,7 @@ impl App {
                     List::new(items).block(focus_block(
                         "通知 · Enter 处理",
                         self.focus == FocusPane::Conversations,
+                        palette,
                     )),
                     sidebar_body,
                 );
@@ -1603,39 +1714,46 @@ impl App {
             let lines: Vec<Line<'_>> = if !contact_verified && !self.messages.is_empty() {
                 vec![Line::from(Span::styled(
                     "消息已加密保存；请在通知页接受请求、比较安全码并认证后查看",
-                    Style::default().fg(Color::DarkGray),
+                    Style::default().fg(palette.muted),
                 ))]
             } else if self.messages.is_empty() {
                 vec![Line::from(Span::styled(
                     "没有消息",
-                    Style::default().fg(Color::DarkGray),
+                    Style::default().fg(palette.muted),
                 ))]
             } else {
                 self.messages
                     .iter()
                     .map(|message| {
-                        let sender = if message.inbound {
+                        let peer = if message.inbound {
                             self.selected_contact()
                                 .map(|c| c.bundle.username.as_str())
                                 .unwrap_or("对方")
                         } else {
-                            "我"
+                            self.profile.username.as_str()
                         };
                         let color = if message.inbound {
-                            Color::Green
+                            palette.inbound
                         } else {
-                            Color::Cyan
+                            palette.outbound
                         };
+                        let prompt = message_prompt(
+                            self.theme,
+                            &self.profile.username,
+                            peer,
+                            message.inbound,
+                        );
+                        let status = message_status_suffix(self.theme, message.status);
                         Line::from(vec![
                             Span::styled(
-                                format!("{sender}: "),
+                                prompt,
                                 Style::default().fg(color).add_modifier(Modifier::BOLD),
                             ),
-                            Span::raw(sanitize_terminal_text(&message.body)),
                             Span::styled(
-                                format!("  [{}]", message.status.label()),
-                                Style::default().fg(Color::DarkGray),
+                                sanitize_terminal_text(&message.body),
+                                Style::default().fg(palette.text),
                             ),
+                            Span::styled(status, Style::default().fg(palette.muted)),
                         ])
                     })
                     .collect()
@@ -1660,7 +1778,11 @@ impl App {
                 let from_top = maximum.saturating_sub(self.message_scroll);
                 paragraph = paragraph
                     .scroll((from_top.min(usize::from(u16::MAX)) as u16, 0))
-                    .block(focus_block(&title, self.focus == FocusPane::Messages));
+                    .block(focus_block(
+                        &title,
+                        self.focus == FocusPane::Messages,
+                        palette,
+                    ));
                 frame.render_widget(paragraph, layout.messages);
                 if visual_lines > visible_messages {
                     let mut state = ScrollbarState::new(visual_lines)
@@ -1685,6 +1807,7 @@ impl App {
         let (composer_title, emoji_offset, emoji_width) = composer_title(
             &self.profile.username,
             layout.composer.width.saturating_sub(2),
+            self.theme,
         );
         self.emoji_button_area = Rect::new(
             layout
@@ -1711,6 +1834,7 @@ impl App {
                 .block(focus_block(
                     &composer_title,
                     self.focus == FocusPane::Composer,
+                    palette,
                 )),
             layout.composer,
         );
@@ -1724,9 +1848,9 @@ impl App {
                 Span::styled(
                     state,
                     Style::default().fg(if self.connected {
-                        Color::Green
+                        palette.success
                     } else {
-                        Color::Red
+                        palette.danger
                     }),
                 ),
                 Span::raw("  "),
@@ -1734,6 +1858,22 @@ impl App {
             ])),
             layout.status,
         );
+
+        if self.sidebar_toggle_area.area() > 0 {
+            frame.render_widget(
+                Paragraph::new(if self.sidebar_collapsed {
+                    "[▶]"
+                } else {
+                    "[◀]"
+                })
+                .style(
+                    Style::default()
+                        .fg(palette.primary)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                self.sidebar_toggle_area,
+            );
+        }
 
         self.render_completion(frame);
         self.render_emoji_picker(frame);
@@ -1832,7 +1972,7 @@ impl App {
             match key.code {
                 KeyCode::Up => {
                     return if self.sidebar_tab == SidebarTab::Notifications
-                        && self.focus == FocusPane::Conversations
+                        && (self.focus == FocusPane::Conversations || self.sidebar_collapsed)
                     {
                         self.select_notification_relative(-1).await
                     } else {
@@ -1841,7 +1981,7 @@ impl App {
                 }
                 KeyCode::Down => {
                     return if self.sidebar_tab == SidebarTab::Notifications
-                        && self.focus == FocusPane::Conversations
+                        && (self.focus == FocusPane::Conversations || self.sidebar_collapsed)
                     {
                         self.select_notification_relative(1).await
                     } else {
@@ -1854,7 +1994,11 @@ impl App {
                 }
                 KeyCode::Char('c') => {
                     self.sidebar_tab = SidebarTab::Conversations;
-                    self.focus = FocusPane::Conversations;
+                    self.focus = if self.sidebar_collapsed {
+                        FocusPane::Messages
+                    } else {
+                        FocusPane::Conversations
+                    };
                     return Ok(());
                 }
                 KeyCode::Backspace => {
@@ -1884,7 +2028,12 @@ impl App {
                 }
                 self.apply_completion();
             } else {
-                self.focus = if backwards {
+                self.focus = if self.sidebar_collapsed {
+                    match self.focus {
+                        FocusPane::Messages => FocusPane::Composer,
+                        FocusPane::Composer | FocusPane::Conversations => FocusPane::Messages,
+                    }
+                } else if backwards {
                     self.focus.previous()
                 } else {
                     self.focus.next()
@@ -1937,7 +2086,12 @@ impl App {
             return Ok(());
         }
         match key.code {
-            KeyCode::Char('x') if self.focus == FocusPane::Conversations => {
+            KeyCode::Char('x')
+                if self.focus == FocusPane::Conversations
+                    || (self.sidebar_collapsed
+                        && self.focus == FocusPane::Messages
+                        && self.sidebar_tab == SidebarTab::Notifications) =>
+            {
                 match self.sidebar_tab {
                     SidebarTab::Conversations => {
                         if let Some(index) = self.selected {
@@ -1952,19 +2106,22 @@ impl App {
                 }
             }
             KeyCode::Enter
-                if self.focus == FocusPane::Conversations
+                if (self.focus == FocusPane::Conversations
+                    || (self.sidebar_collapsed && self.focus == FocusPane::Messages))
                     && self.sidebar_tab == SidebarTab::Notifications =>
             {
                 self.activate_notification_primary().await?;
             }
             KeyCode::Char('r')
-                if self.focus == FocusPane::Conversations
+                if (self.focus == FocusPane::Conversations
+                    || (self.sidebar_collapsed && self.focus == FocusPane::Messages))
                     && self.sidebar_tab == SidebarTab::Notifications =>
             {
                 self.reject_selected_chat_request().await?;
             }
             KeyCode::Char('d')
-                if self.focus == FocusPane::Conversations
+                if (self.focus == FocusPane::Conversations
+                    || (self.sidebar_collapsed && self.focus == FocusPane::Messages))
                     && self.sidebar_tab == SidebarTab::Notifications =>
             {
                 self.dismiss_selected_notification().await?;
@@ -2066,6 +2223,24 @@ impl App {
         } else if let Some(query) = trimmed.strip_prefix("/emoji ") {
             self.open_emoji_picker(query.trim());
             Ok(())
+        } else if trimmed == "/theme" {
+            self.status = format!(
+                "当前主题：{}；可用主题：{}；使用 /theme <名称> 切换",
+                self.theme.name(),
+                UiTheme::AVAILABLE
+            );
+            Ok(())
+        } else if let Some(name) = trimmed.strip_prefix("/theme ") {
+            self.set_theme(name).await
+        } else if trimmed == "/sidebar" {
+            self.set_sidebar_collapsed(!self.sidebar_collapsed).await
+        } else if let Some(action) = trimmed.strip_prefix("/sidebar ") {
+            match action.trim().to_ascii_lowercase().as_str() {
+                "hide" | "collapse" | "收起" => self.set_sidebar_collapsed(true).await,
+                "show" | "expand" | "展开" => self.set_sidebar_collapsed(false).await,
+                "toggle" | "切换" => self.set_sidebar_collapsed(!self.sidebar_collapsed).await,
+                _ => Err(anyhow!("未知侧边栏操作；可用：hide、show、toggle")),
+            }
         } else if trimmed == "/verify" {
             self.verify_selected().await
         } else if trimmed == "/confirm" {
@@ -2208,8 +2383,18 @@ impl App {
             return;
         }
         let commands = [
-            "/chat ", "/emoji", "/search ", "/verify", "/pair ", "/confirm", "/sync", "/help",
-            "/exit", "/quit",
+            "/chat ",
+            "/emoji",
+            "/theme ",
+            "/sidebar ",
+            "/search ",
+            "/verify",
+            "/pair ",
+            "/confirm",
+            "/sync",
+            "/help",
+            "/exit",
+            "/quit",
         ];
         let candidates = if let Some(prefix) = input.strip_prefix("/chat ") {
             self.contacts
@@ -2225,6 +2410,19 @@ impl App {
                         || request.pending_device_name.starts_with(prefix)
                 })
                 .map(|request| format!("/pair {}", request.pending_device_id))
+                .collect()
+        } else if let Some(prefix) = input.strip_prefix("/theme ") {
+            [UiTheme::Default, UiTheme::Terminal]
+                .into_iter()
+                .map(UiTheme::name)
+                .filter(|theme| theme.starts_with(prefix))
+                .map(|theme| format!("/theme {theme}"))
+                .collect()
+        } else if let Some(prefix) = input.strip_prefix("/sidebar ") {
+            ["hide", "show", "toggle"]
+                .into_iter()
+                .filter(|action| action.starts_with(prefix))
+                .map(|action| format!("/sidebar {action}"))
                 .collect()
         } else if !input.contains(' ') {
             commands
@@ -2246,6 +2444,43 @@ impl App {
         };
     }
 
+    async fn set_theme(&mut self, name: &str) -> Result<()> {
+        let theme = UiTheme::parse(name).ok_or_else(|| {
+            anyhow!(
+                "未知主题“{}”；可用主题：{}",
+                name.trim(),
+                UiTheme::AVAILABLE
+            )
+        })?;
+        self.store.save_ui_preference("theme", theme.name()).await?;
+        self.theme = theme;
+        self.redraw_requested = true;
+        self.status = format!("已切换到 {} 主题，并保存为本机默认设置", theme.name());
+        Ok(())
+    }
+
+    async fn set_sidebar_collapsed(&mut self, collapsed: bool) -> Result<()> {
+        self.store
+            .save_ui_preference(
+                "sidebar_collapsed",
+                if collapsed { "true" } else { "false" },
+            )
+            .await?;
+        self.sidebar_collapsed = collapsed;
+        if collapsed && self.focus == FocusPane::Conversations {
+            self.focus = FocusPane::Messages;
+        } else if !collapsed && self.layout.narrow {
+            self.focus = FocusPane::Conversations;
+        }
+        self.redraw_requested = true;
+        self.status = if collapsed {
+            "已收起会话侧边栏；点击 [▶] 或执行 /sidebar 重新展开".to_owned()
+        } else {
+            "已展开会话侧边栏".to_owned()
+        };
+        Ok(())
+    }
+
     fn apply_completion(&mut self) {
         if let Some(candidate) = self.completion.selected().map(str::to_owned) {
             self.editor.set(candidate);
@@ -2256,6 +2491,7 @@ impl App {
         if !self.completion.is_open() || self.help_visible {
             return;
         }
+        let palette = self.theme.palette();
         let count = self.completion.candidates.len().min(6) as u16;
         let height = count + 2;
         let width = self.layout.composer.width.clamp(20, 48);
@@ -2276,8 +2512,8 @@ impl App {
             .map(|(index, candidate)| {
                 let style = if first + index == self.completion.selected {
                     Style::default()
-                        .fg(Color::Black)
-                        .bg(Color::Cyan)
+                        .fg(palette.selection_foreground)
+                        .bg(palette.selection_background)
                         .add_modifier(Modifier::BOLD)
                 } else {
                     Style::default()
@@ -2298,6 +2534,7 @@ impl App {
             self.emoji_grid_area = Rect::default();
             return;
         }
+        let palette = self.theme.palette();
         let width = frame.area().width.saturating_sub(4).min(68);
         let height = frame.area().height.saturating_sub(2).min(14);
         let area = centered_rect(width, height, frame.area());
@@ -2324,14 +2561,14 @@ impl App {
             self.emoji_picker.scroll = first_row * columns;
         }
         let mut lines = vec![Line::from(vec![
-            Span::styled("搜索：", Style::default().fg(Color::DarkGray)),
+            Span::styled("搜索：", Style::default().fg(palette.muted)),
             Span::styled(
                 if self.emoji_picker.query.is_empty() {
                     "输入中文或英文关键词"
                 } else {
                     self.emoji_picker.query.as_str()
                 },
-                Style::default().fg(Color::White),
+                Style::default().fg(palette.text),
             ),
         ])];
         if matches.is_empty() {
@@ -2355,11 +2592,11 @@ impl App {
                     );
                     let style = if visible_index == self.emoji_picker.selected {
                         Style::default()
-                            .fg(Color::Black)
-                            .bg(Color::Cyan)
+                            .fg(palette.selection_foreground)
+                            .bg(palette.selection_background)
                             .add_modifier(Modifier::BOLD)
                     } else {
-                        Style::default().fg(Color::White)
+                        Style::default().fg(palette.text)
                     };
                     cells.push(Span::styled(label, style));
                 }
@@ -2372,7 +2609,7 @@ impl App {
                 Block::default()
                     .title("Emoji · 方向键选择 · Enter/点击插入 · Esc 关闭")
                     .borders(Borders::ALL)
-                    .border_style(Style::default().fg(Color::Cyan)),
+                    .border_style(Style::default().fg(palette.primary)),
             ),
             area,
         );
@@ -2382,10 +2619,12 @@ impl App {
         if area.area() == 0 {
             return;
         }
+        let palette = self.theme.palette();
         let Some(notification) = self.selected_notification().cloned() else {
             frame.render_widget(
-                Paragraph::new("暂无通知；当设备配对或收到新的会话请求时会显示在这里")
-                    .block(focus_block("通知详情", self.focus == FocusPane::Messages)),
+                Paragraph::new("暂无通知；当设备配对或收到新的会话请求时会显示在这里").block(
+                    focus_block("通知详情", self.focus == FocusPane::Messages, palette),
+                ),
                 area,
             );
             return;
@@ -2480,7 +2719,7 @@ impl App {
             Line::from(Span::styled(
                 kind,
                 Style::default()
-                    .fg(Color::Cyan)
+                    .fg(palette.primary)
                     .add_modifier(Modifier::BOLD),
             )),
             Line::from(""),
@@ -2492,11 +2731,11 @@ impl App {
             let sas = pairing.channel.sas_decimals();
             lines.push(Line::from(""));
             lines.push(Line::from(vec![
-                Span::styled("短认证码：", Style::default().fg(Color::DarkGray)),
+                Span::styled("短认证码：", Style::default().fg(palette.muted)),
                 Span::styled(
                     format!("{}-{}-{}", sas.0, sas.1, sas.2),
                     Style::default()
-                        .fg(Color::Cyan)
+                        .fg(palette.primary)
                         .add_modifier(Modifier::BOLD),
                 ),
             ]));
@@ -2509,11 +2748,11 @@ impl App {
         {
             lines.push(Line::from(""));
             lines.push(Line::from(vec![
-                Span::styled("安全码：", Style::default().fg(Color::DarkGray)),
+                Span::styled("安全码：", Style::default().fg(palette.muted)),
                 Span::styled(
                     code,
                     Style::default()
-                        .fg(Color::Cyan)
+                        .fg(palette.primary)
                         .add_modifier(Modifier::BOLD),
                 ),
             ]));
@@ -2523,7 +2762,11 @@ impl App {
         frame.render_widget(
             Paragraph::new(lines)
                 .wrap(Wrap { trim: false })
-                .block(focus_block("通知详情", self.focus == FocusPane::Messages)),
+                .block(focus_block(
+                    "通知详情",
+                    self.focus == FocusPane::Messages,
+                    palette,
+                )),
             area,
         );
         let (primary, secondary) = match notification.kind {
@@ -2544,7 +2787,7 @@ impl App {
                 } else {
                     Some("开始配对")
                 };
-                (label.map(|label| (label, Color::Cyan)), None)
+                (label.map(|label| (label, palette.primary)), None)
             }
             NotificationKind::ChatRequest
                 if notification.state == NotificationState::Pending
@@ -2556,10 +2799,13 @@ impl App {
                         }
                     ) =>
             {
-                (Some(("接受", Color::Green)), Some(("拒绝", Color::Red)))
+                (
+                    Some(("接受", palette.success)),
+                    Some(("拒绝", palette.danger)),
+                )
             }
             NotificationKind::ChatResponse if can_verify => {
-                (Some(("已核对，认证", Color::Green)), None)
+                (Some(("已核对，认证", palette.success)), None)
             }
             _ => (None, None),
         };
@@ -2760,6 +3006,7 @@ impl App {
             self.delete_cancel_area = Rect::default();
             return;
         };
+        let palette = self.theme.palette();
         let width = frame.area().width.saturating_sub(4).min(62);
         let height = frame.area().height.saturating_sub(2).min(10);
         let area = centered_rect(width, height, frame.area());
@@ -2797,7 +3044,7 @@ impl App {
                 Block::default()
                     .title(title)
                     .borders(Borders::ALL)
-                    .border_style(Style::default().fg(Color::Cyan)),
+                    .border_style(Style::default().fg(palette.primary)),
             ),
             area,
         );
@@ -2825,27 +3072,28 @@ impl App {
             frame,
             self.delete_cancel_area,
             cancel_label,
-            Color::Cyan,
+            palette.primary,
             !dialog.confirm_selected,
         );
         render_choice_button(
             frame,
             self.delete_confirm_area,
             confirm_label,
-            Color::Red,
+            palette.danger,
             dialog.confirm_selected,
         );
     }
 
     fn render_help(&self, frame: &mut ratatui::Frame<'_>) {
+        let palette = self.theme.palette();
         let width = frame.area().width.saturating_sub(4).min(70);
-        let height = frame.area().height.saturating_sub(2).min(22);
+        let height = frame.area().height.saturating_sub(2).min(24);
         let area = centered_rect(width, height, frame.area());
         let help = [
             Line::from(Span::styled(
                 "安全私聊操作",
                 Style::default()
-                    .fg(Color::Cyan)
+                    .fg(palette.primary)
                     .add_modifier(Modifier::BOLD),
             )),
             Line::from(""),
@@ -2853,6 +3101,7 @@ impl App {
             Line::from("Alt-Up / Alt-Down   切换会话"),
             Line::from("Alt-N / Alt-C       通知 / 会话 Tab"),
             Line::from("Alt-E               打开 Unicode Emoji 选择器"),
+            Line::from("[◀] / [▶]          收起 / 展开会话侧边栏"),
             Line::from("会话 Tab: x         删除会话并打开二次确认"),
             Line::from("通知 Tab: Enter 处理，r 拒绝，d 已读，x 删除"),
             Line::from("PageUp / PageDown   滚动消息"),
@@ -2863,22 +3112,20 @@ impl App {
             Line::from("Ctrl-R / Ctrl-L     同步重连 / 重绘屏幕"),
             Line::from("Ctrl-C / Ctrl-Q      退出"),
             Line::from(""),
-            Line::from(
-                "/chat 用户名 · /emoji [关键词] · /search 关键词 · /verify · /pair · /confirm",
-            ),
-            Line::from("/sync · /help · /exit · /quit"),
-            Line::from("/exit · /quit · //文本（发送以 / 开头的正文）"),
+            Line::from("/chat 用户名 · /emoji [关键词] · /theme [名称] · /search 关键词"),
+            Line::from("/sidebar · /verify · /pair · /confirm · /sync"),
+            Line::from("/help · /exit · /quit · //文本（发送以 / 开头的正文）"),
             Line::from(""),
             Line::from(Span::styled(
                 "Esc 或 F1 关闭帮助",
-                Style::default().fg(Color::DarkGray),
+                Style::default().fg(palette.muted),
             )),
         ];
         frame.render_widget(Clear, area);
         frame.render_widget(
             Paragraph::new(help.to_vec())
                 .wrap(Wrap { trim: false })
-                .block(focus_block("帮助", true)),
+                .block(focus_block("帮助", true, palette)),
             area,
         );
     }
@@ -2904,6 +3151,10 @@ impl App {
         let position = Position::new(mouse.column, mouse.row);
         match mouse.kind {
             MouseEventKind::Down(MouseButton::Left) => {
+                if self.sidebar_toggle_area.contains(position) {
+                    self.set_sidebar_collapsed(!self.sidebar_collapsed).await?;
+                    return Ok(());
+                }
                 if self.emoji_button_area.contains(position) {
                     self.open_emoji_picker("");
                     return Ok(());
@@ -3700,7 +3951,26 @@ impl App {
                     )
                     .await?;
                 }
-                self.status = "设备已激活；请重启客户端，之后将使用设备签名认证".to_owned();
+                self.pairing = None;
+                self.connected = false;
+                self.reconnect_at = Instant::now();
+                self.status = "设备已激活，正在切换到设备签名连接".to_owned();
+                match self.reconnect_transport().await {
+                    Ok(()) => {
+                        self.connected = true;
+                        self.reconnect_backoff = 1;
+                        self.post_activation_sync = true;
+                        self.status = "设备配对成功，已自动切换到正式连接，无需重启".to_owned();
+                    }
+                    Err(error) => {
+                        self.reconnect_backoff = (self.reconnect_backoff * 2).min(30);
+                        self.reconnect_at =
+                            Instant::now() + Duration::from_secs(self.reconnect_backoff);
+                        self.status = format!(
+                            "设备已激活，无需重启；自动连接暂未成功，将继续重试：{error:#}"
+                        );
+                    }
+                }
             }
             _ => {}
         }
@@ -4914,56 +5184,12 @@ impl App {
 
     async fn try_reconnect(&mut self) {
         if self.profile.pending {
-            self.status = "待批准设备断线后需要重启并再次输入账号密码".to_owned();
+            self.status = "设备仍在等待批准；请保持客户端运行以继续配对".to_owned();
             self.reconnect_at = Instant::now() + Duration::from_secs(30);
             return;
         }
-        let result: Result<(RpcClient, mpsc::Receiver<v1::Frame>)> = async {
-            let mut raw =
-                RawConnection::connect(&self.profile.server_url, self.profile.spki_pin.as_deref())
-                    .await?;
-            let response = raw
-                .request(Body::ClientHello(v1::ClientHello {
-                    username: self.profile.username.clone(),
-                    device_id: self.profile.identity.device_id().to_owned(),
-                }))
-                .await?;
-            let Some(Body::AuthChallenge(challenge)) = response.body else {
-                bail!("重连握手缺少挑战");
-            };
-            let host = url::Url::parse(&self.profile.server_url)?
-                .host_str()
-                .ok_or_else(|| anyhow!("服务器 URL 缺少主机名"))?
-                .to_owned();
-            let payload = tui_chat_protocol::auth_challenge_payload(
-                &host,
-                &self.profile.username,
-                self.profile.identity.device_id(),
-                &challenge.nonce,
-                challenge.expires_at_ms,
-            );
-            let response = raw
-                .request(Body::DeviceAuth(v1::DeviceAuth {
-                    username: self.profile.username.clone(),
-                    device_id: self.profile.identity.device_id().to_owned(),
-                    signature: self.profile.identity.sign_auth_challenge(&payload),
-                }))
-                .await?;
-            let Some(Body::Authenticated(auth)) = response.body else {
-                bail!("重连认证失败");
-            };
-            if auth.account_id != self.profile.account_id
-                || auth.account_master_key != self.profile.account_master_public
-            {
-                bail!("重连时账号身份发生变化");
-            }
-            Ok(raw.start())
-        }
-        .await;
-        match result {
-            Ok((rpc, events)) => {
-                self.rpc = rpc;
-                self.events = events;
+        match self.reconnect_transport().await {
+            Ok(()) => {
                 self.connected = true;
                 self.reconnect_backoff = 1;
                 self.status = "已重新连接，正在补拉离线消息".to_owned();
@@ -4979,6 +5205,52 @@ impl App {
                     Instant::now() + Duration::from_secs(self.reconnect_backoff + jitter);
             }
         }
+    }
+
+    async fn reconnect_transport(&mut self) -> Result<()> {
+        let mut raw =
+            RawConnection::connect(&self.profile.server_url, self.profile.spki_pin.as_deref())
+                .await?;
+        let response = raw
+            .request(Body::ClientHello(v1::ClientHello {
+                username: self.profile.username.clone(),
+                device_id: self.profile.identity.device_id().to_owned(),
+            }))
+            .await?;
+        let Some(Body::AuthChallenge(challenge)) = response.body else {
+            bail!("重连握手缺少挑战");
+        };
+        let host = url::Url::parse(&self.profile.server_url)?
+            .host_str()
+            .ok_or_else(|| anyhow!("服务器 URL 缺少主机名"))?
+            .to_owned();
+        let payload = tui_chat_protocol::auth_challenge_payload(
+            &host,
+            &self.profile.username,
+            self.profile.identity.device_id(),
+            &challenge.nonce,
+            challenge.expires_at_ms,
+        );
+        let response = raw
+            .request(Body::DeviceAuth(v1::DeviceAuth {
+                username: self.profile.username.clone(),
+                device_id: self.profile.identity.device_id().to_owned(),
+                signature: self.profile.identity.sign_auth_challenge(&payload),
+            }))
+            .await?;
+        let Some(Body::Authenticated(auth)) = response.body else {
+            bail!("重连认证失败");
+        };
+        if auth.pending_device
+            || auth.account_id != self.profile.account_id
+            || auth.account_master_key != self.profile.account_master_public
+        {
+            bail!("重连时账号或设备状态发生变化");
+        }
+        let (rpc, events) = raw.start();
+        self.rpc = rpc;
+        self.events = events;
+        Ok(())
     }
 
     async fn select_relative(&mut self, direction: isize) -> Result<()> {
@@ -5029,11 +5301,16 @@ impl App {
         messages
             .iter()
             .map(|message| {
-                let sender = if message.inbound { peer_name } else { "我" };
                 let rendered = format!(
-                    "{sender}: {}  [{}]",
+                    "{}{}{}",
+                    message_prompt(
+                        self.theme,
+                        &self.profile.username,
+                        peer_name,
+                        message.inbound,
+                    ),
                     sanitize_terminal_text(&message.body),
-                    message.status.label()
+                    message_status_suffix(self.theme, message.status)
                 );
                 editor_visual_line_count(&rendered, width)
             })
@@ -5203,6 +5480,24 @@ fn notification_requires_action(state: NotificationState) -> bool {
     )
 }
 
+fn message_prompt(theme: UiTheme, username: &str, peer_name: &str, inbound: bool) -> String {
+    match theme {
+        UiTheme::Default => format!("{}: ", if inbound { peer_name } else { "我" }),
+        UiTheme::Terminal => format!(
+            "{}@{}:~$ ",
+            if inbound { peer_name } else { username },
+            if inbound { "remote" } else { "local" }
+        ),
+    }
+}
+
+fn message_status_suffix(theme: UiTheme, status: MessageStatus) -> String {
+    match theme {
+        UiTheme::Default => format!("  [{}]", status.label()),
+        UiTheme::Terminal => format!("  # {}", status.label()),
+    }
+}
+
 fn chat_decision_state(decision: &str) -> Result<NotificationState> {
     match decision {
         "accepted" => Ok(NotificationState::Accepted),
@@ -5235,9 +5530,15 @@ fn should_offer_contact_verification(
         && (!contact_verified || identity_changed)
 }
 
-fn composer_title(username: &str, available_width: u16) -> (String, u16, u16) {
-    let detailed_prefix = format!("输入 · @{username} · Enter 发送 · ");
-    let compact_prefix = format!("@{username} · Enter 发送 · ");
+fn composer_title(username: &str, available_width: u16, theme: UiTheme) -> (String, u16, u16) {
+    let detailed_prefix = match theme {
+        UiTheme::Default => format!("输入 · @{username} · Enter 发送 · "),
+        UiTheme::Terminal => format!("{username}@tui-chat:~$ · Enter 发送 · "),
+    };
+    let compact_prefix = match theme {
+        UiTheme::Default => format!("@{username} · Enter 发送 · "),
+        UiTheme::Terminal => format!("{username}:~$ · Enter 发送 · "),
+    };
     let send_prefix = "Enter 发送 · ";
     let short_prefix = "发送 · ";
     let full_button = "[😊 表情]";
@@ -5294,11 +5595,11 @@ fn fit_to_display_width(text: &str, width: usize) -> String {
     output
 }
 
-fn focus_block<'a>(title: &'a str, focused: bool) -> Block<'a> {
+fn focus_block<'a>(title: &'a str, focused: bool, palette: ThemePalette) -> Block<'a> {
     let color = if focused {
-        Color::Rgb(78, 201, 216)
+        palette.primary
     } else {
-        Color::DarkGray
+        palette.muted
     };
     Block::default()
         .title(title)
@@ -5359,6 +5660,18 @@ fn sidebar_tab_areas(area: Rect, notification_label: &str) -> (Rect, Rect) {
         1,
     );
     (conversation, notification)
+}
+
+fn sidebar_toggle_area(layout: UiLayout, collapsed: bool) -> Rect {
+    let area = if collapsed {
+        layout.messages
+    } else {
+        layout.conversations
+    };
+    if area.width < 5 || area.height == 0 {
+        return Rect::default();
+    }
+    Rect::new(area.right().saturating_sub(4), area.y, 3, 1)
 }
 
 fn list_delete_button_areas(
@@ -5488,19 +5801,19 @@ mod tests {
     #[test]
     fn narrow_layout_shows_only_the_focused_main_pane() {
         let area = Rect::new(0, 0, 60, 24);
-        let conversations = UiLayout::calculate(area, FocusPane::Conversations, 1);
+        let conversations = UiLayout::calculate(area, FocusPane::Conversations, 1, false);
         assert!(conversations.narrow);
         assert!(conversations.conversations.area() > 0);
         assert_eq!(conversations.messages, Rect::default());
 
-        let messages = UiLayout::calculate(area, FocusPane::Messages, 1);
+        let messages = UiLayout::calculate(area, FocusPane::Messages, 1, false);
         assert_eq!(messages.conversations, Rect::default());
         assert!(messages.messages.area() > 0);
     }
 
     #[test]
     fn wide_layout_keeps_conversations_and_messages_visible() {
-        let layout = UiLayout::calculate(Rect::new(0, 0, 100, 30), FocusPane::Composer, 3);
+        let layout = UiLayout::calculate(Rect::new(0, 0, 100, 30), FocusPane::Composer, 3, false);
         assert!(!layout.narrow);
         assert!(layout.conversations.area() > 0);
         assert!(layout.messages.area() > 0);
@@ -5508,17 +5821,66 @@ mod tests {
     }
 
     #[test]
+    fn collapsed_sidebar_gives_the_full_main_area_to_messages() {
+        let area = Rect::new(0, 0, 100, 30);
+        let expanded = UiLayout::calculate(area, FocusPane::Composer, 1, false);
+        let collapsed = UiLayout::calculate(area, FocusPane::Composer, 1, true);
+
+        assert!(expanded.conversations.area() > 0);
+        assert_eq!(collapsed.conversations, Rect::default());
+        assert_eq!(collapsed.messages.x, area.x);
+        assert_eq!(collapsed.messages.width, area.width);
+
+        let expanded_button = sidebar_toggle_area(expanded, false);
+        let collapsed_button = sidebar_toggle_area(collapsed, true);
+        assert!(
+            expanded
+                .conversations
+                .contains(Position::new(expanded_button.x, expanded_button.y))
+        );
+        assert!(
+            collapsed
+                .messages
+                .contains(Position::new(collapsed_button.x, collapsed_button.y))
+        );
+        assert_eq!(expanded_button.width, 3);
+        assert_eq!(collapsed_button.width, 3);
+    }
+
+    #[test]
     fn emoji_button_stays_on_the_composer_title_at_narrow_widths() {
-        let (wide, wide_offset, wide_button_width) = composer_title("alice", 80);
+        let (wide, wide_offset, wide_button_width) = composer_title("alice", 80, UiTheme::Default);
         assert!(wide.contains("Enter 发送 · [😊 表情]"));
         assert!(wide.contains("Shift-Enter 换行"));
         assert!(usize::from(wide_offset + wide_button_width) <= 80);
 
         let (narrow, narrow_offset, narrow_button_width) =
-            composer_title("a-very-long-username", 20);
+            composer_title("a-very-long-username", 20, UiTheme::Default);
         assert!(narrow.contains("[😊"));
         assert!(UnicodeWidthStr::width(narrow.as_str()) <= 20);
         assert!(usize::from(narrow_offset + narrow_button_width) <= 20);
+    }
+
+    #[test]
+    fn terminal_theme_uses_a_shell_prompt_and_accepts_aliases() {
+        let (title, _, _) = composer_title("alice", 80, UiTheme::Terminal);
+        assert!(title.starts_with("alice@tui-chat:~$"));
+        assert_eq!(
+            message_prompt(UiTheme::Terminal, "alice", "bob", false),
+            "alice@local:~$ "
+        );
+        assert_eq!(
+            message_prompt(UiTheme::Terminal, "alice", "bob", true),
+            "bob@remote:~$ "
+        );
+        assert_eq!(
+            message_status_suffix(UiTheme::Terminal, MessageStatus::Read),
+            "  # 已读"
+        );
+        assert_eq!(UiTheme::parse("terminal"), Some(UiTheme::Terminal));
+        assert_eq!(UiTheme::parse("shell"), Some(UiTheme::Terminal));
+        assert_eq!(UiTheme::parse("default"), Some(UiTheme::Default));
+        assert_eq!(UiTheme::parse("unknown"), None);
     }
 
     #[test]

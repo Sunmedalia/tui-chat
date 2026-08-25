@@ -444,6 +444,31 @@ impl LocalStore {
         Ok(())
     }
 
+    pub async fn ui_preference(&self, key: &str) -> Result<Option<String>> {
+        Ok(sqlx::query_scalar(
+            "SELECT preference_value FROM ui_preferences WHERE preference_key = ?",
+        )
+        .bind(key)
+        .fetch_optional(&self.pool)
+        .await?)
+    }
+
+    pub async fn save_ui_preference(&self, key: &str, value: &str) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO ui_preferences(preference_key, preference_value, updated_at_ms)
+             VALUES(?, ?, ?)
+             ON CONFLICT(preference_key) DO UPDATE SET
+                 preference_value = excluded.preference_value,
+                 updated_at_ms = excluded.updated_at_ms",
+        )
+        .bind(key)
+        .bind(value)
+        .bind(now_ms())
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
     pub async fn commit_outgoing(
         &self,
         vault: &VaultSession,
@@ -1269,6 +1294,36 @@ fn now_ms() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn ui_preferences_are_persisted_and_replaceable() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let store = LocalStore::open(&directory.path().join("client.db")).await?;
+
+        assert_eq!(store.ui_preference("theme").await?, None);
+        store.save_ui_preference("theme", "terminal").await?;
+        assert_eq!(
+            store.ui_preference("theme").await?.as_deref(),
+            Some("terminal")
+        );
+        store.save_ui_preference("theme", "default").await?;
+        assert_eq!(
+            store.ui_preference("theme").await?.as_deref(),
+            Some("default")
+        );
+        store
+            .save_ui_preference("sidebar_collapsed", "true")
+            .await?;
+        assert_eq!(
+            store.ui_preference("sidebar_collapsed").await?.as_deref(),
+            Some("true")
+        );
+        assert_eq!(
+            store.ui_preference("theme").await?.as_deref(),
+            Some("default")
+        );
+        Ok(())
+    }
 
     fn bundle(account_id: &str, username: &str) -> UserBundle {
         UserBundle {
