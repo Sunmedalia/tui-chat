@@ -2,7 +2,7 @@
 	@chat_ws path /v2/ws
 	handle @chat_ws {
 		reverse_proxy server:8080 {
-			health_uri /healthz
+			health_uri /readyz
 			health_interval 30s
 		}
 	}

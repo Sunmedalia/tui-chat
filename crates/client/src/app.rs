@@ -1,6 +1,6 @@
 use std::{
     borrow::Cow,
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     io,
     time::{Duration, Instant},
 };
@@ -422,6 +422,10 @@ enum DeleteTarget {
         title: String,
         request_id: String,
     },
+    Device {
+        device_id: String,
+        device_name: String,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -645,6 +649,31 @@ struct PairingSession {
     peer_confirmed: bool,
 }
 
+struct ReconnectTransport {
+    rpc: RpcClient,
+    events: mpsc::Receiver<v1::Frame>,
+    server_capabilities: Vec<String>,
+}
+
+struct ReconnectInput {
+    server_url: String,
+    spki_pin: Option<String>,
+    username: String,
+    account_id: String,
+    account_master_public: Vec<u8>,
+    device_id: String,
+    identity: Vec<u8>,
+}
+
+#[derive(Debug)]
+enum BackgroundRequest {
+    Sync,
+    DeviceList,
+    DeviceRevoke { device_name: String },
+    ReconcilePairing,
+    Outbox { logical_id: String },
+}
+
 pub struct App {
     store: LocalStore,
     vault: VaultSession,
@@ -685,6 +714,13 @@ pub struct App {
     delete_cancel_area: Rect,
     notification_primary_action_area: Rect,
     notification_secondary_action_area: Rect,
+    device_manager_visible: bool,
+    own_devices: Vec<v1::OwnDeviceInfo>,
+    own_device_selected: usize,
+    own_device_list_area: Rect,
+    own_device_close_area: Rect,
+    own_device_refresh_area: Rect,
+    own_device_revoke_areas: Vec<(usize, Rect)>,
     dragging: Option<DragTarget>,
     mouse_enabled: bool,
     terminal_focused: bool,
@@ -697,6 +733,14 @@ pub struct App {
     reconnect_at: Instant,
     reconnect_backoff: u64,
     post_activation_sync: bool,
+    background_requests: HashMap<String, BackgroundRequest>,
+    background_deadlines: HashMap<String, Instant>,
+    blocked_outbox: HashSet<String>,
+    outbox_retry_after: HashMap<String, Instant>,
+    sync_in_flight: bool,
+    reconnect_tx: mpsc::Sender<std::result::Result<ReconnectTransport, String>>,
+    reconnect_rx: mpsc::Receiver<std::result::Result<ReconnectTransport, String>>,
+    reconnect_in_flight: bool,
 }
 
 impl App {
@@ -725,6 +769,7 @@ impl App {
                 .migrate_legacy_messages(&migration_vault)
                 .await;
         });
+        let (reconnect_tx, reconnect_rx) = mpsc::channel(1);
         let mut app = Self {
             store,
             vault,
@@ -765,6 +810,13 @@ impl App {
             delete_cancel_area: Rect::default(),
             notification_primary_action_area: Rect::default(),
             notification_secondary_action_area: Rect::default(),
+            device_manager_visible: false,
+            own_devices: Vec::new(),
+            own_device_selected: 0,
+            own_device_list_area: Rect::default(),
+            own_device_close_area: Rect::default(),
+            own_device_refresh_area: Rect::default(),
+            own_device_revoke_areas: Vec::new(),
             dragging: None,
             mouse_enabled,
             terminal_focused: true,
@@ -777,6 +829,14 @@ impl App {
             reconnect_at: Instant::now(),
             reconnect_backoff: 1,
             post_activation_sync: false,
+            background_requests: HashMap::new(),
+            background_deadlines: HashMap::new(),
+            blocked_outbox: HashSet::new(),
+            outbox_retry_after: HashMap::new(),
+            sync_in_flight: false,
+            reconnect_tx,
+            reconnect_rx,
+            reconnect_in_flight: false,
         };
         app.restore_pairing_state_from_notifications()?;
         app.restore_pairing_requests_from_notifications();
@@ -1415,6 +1475,12 @@ impl App {
                     }
                     dirty = true;
                 }
+                reconnect = self.reconnect_rx.recv(), if self.reconnect_in_flight => {
+                    if let Some(reconnect) = reconnect {
+                        self.handle_reconnect_result(reconnect).await;
+                    }
+                    dirty = true;
+                }
                 _ = service_tick.tick() => {
                     self.service_step(&mut heartbeat_counter).await;
                     dirty = true;
@@ -1427,6 +1493,7 @@ impl App {
     }
 
     async fn service_step(&mut self, heartbeat_counter: &mut u8) {
+        self.expire_background_requests();
         if let Err(error) = self.autosave_draft().await {
             self.status = format!("草稿自动保存失败：{error:#}");
         }
@@ -1496,6 +1563,7 @@ impl App {
         self.notification_primary_action_area = Rect::default();
         self.notification_secondary_action_area = Rect::default();
         self.emoji_button_area = Rect::default();
+        self.own_device_revoke_areas.clear();
 
         let sidebar_parts = Layout::default()
             .direction(Direction::Vertical)
@@ -1877,6 +1945,9 @@ impl App {
 
         self.render_completion(frame);
         self.render_emoji_picker(frame);
+        if self.device_manager_visible {
+            self.render_device_manager(frame);
+        }
         if self.help_visible {
             self.render_help(frame);
         }
@@ -1884,6 +1955,7 @@ impl App {
         if self.focus == FocusPane::Composer
             && !self.help_visible
             && !self.emoji_picker.visible
+            && !self.device_manager_visible
             && self.delete_confirmation.is_none()
         {
             frame.set_cursor_position(Position::new(
@@ -1914,6 +1986,12 @@ impl App {
                     self.append_emoji_query(&text);
                     return Ok(());
                 }
+                if self.device_manager_visible
+                    || self.help_visible
+                    || self.delete_confirmation.is_some()
+                {
+                    return Ok(());
+                }
                 self.focus = FocusPane::Composer;
                 if !self.editor.insert(&text, tui_chat_protocol::MAX_TEXT_BYTES) {
                     self.status = "粘贴内容已截断到 16 KiB".to_owned();
@@ -1942,6 +2020,28 @@ impl App {
         }
         if self.delete_confirmation.is_some() {
             self.handle_delete_confirmation_key(key).await?;
+            return Ok(());
+        }
+        if self.device_manager_visible {
+            match key.code {
+                KeyCode::Esc | KeyCode::Char('q') => self.close_device_manager(),
+                KeyCode::Up | KeyCode::Char('k') => {
+                    self.own_device_selected = self.own_device_selected.saturating_sub(1);
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    self.own_device_selected = (self.own_device_selected + 1)
+                        .min(self.own_devices.len().saturating_sub(1));
+                }
+                KeyCode::Char('r') => {
+                    if let Err(error) = self.refresh_own_devices().await {
+                        self.status = format!("刷新设备失败：{error:#}");
+                    }
+                }
+                KeyCode::Char('x') | KeyCode::Delete => {
+                    self.request_revoke_selected_device();
+                }
+                _ => {}
+            }
             return Ok(());
         }
         if key.modifiers.contains(KeyModifiers::ALT) && key.code == KeyCode::Char('e') {
@@ -2241,6 +2341,8 @@ impl App {
                 "toggle" | "切换" => self.set_sidebar_collapsed(!self.sidebar_collapsed).await,
                 _ => Err(anyhow!("未知侧边栏操作；可用：hide、show、toggle")),
             }
+        } else if trimmed == "/devices" {
+            self.open_device_manager().await
         } else if trimmed == "/verify" {
             self.verify_selected().await
         } else if trimmed == "/confirm" {
@@ -2251,6 +2353,13 @@ impl App {
             self.start_pairing(Some(device.trim())).await
         } else if trimmed == "/sync" {
             self.sync().await
+        } else if trimmed == "/retry" {
+            let count = self.blocked_outbox.len() + self.outbox_retry_after.len();
+            self.blocked_outbox.clear();
+            self.outbox_retry_after.clear();
+            self.resend_outbox().await;
+            self.status = format!("已重新启用 {count} 条本地发件箱消息的发送");
+            Ok(())
         } else if let Some(query) = trimmed.strip_prefix("/search ") {
             self.search_loaded_messages(query.trim())
         } else if let Some(username) = trimmed.strip_prefix("/chat ") {
@@ -2387,11 +2496,13 @@ impl App {
             "/emoji",
             "/theme ",
             "/sidebar ",
+            "/devices",
             "/search ",
             "/verify",
             "/pair ",
             "/confirm",
             "/sync",
+            "/retry",
             "/help",
             "/exit",
             "/quit",
@@ -2479,6 +2590,67 @@ impl App {
             "已展开会话侧边栏".to_owned()
         };
         Ok(())
+    }
+
+    async fn open_device_manager(&mut self) -> Result<()> {
+        if !self
+            .profile
+            .server_capabilities
+            .iter()
+            .any(|capability| capability == tui_chat_protocol::CAPABILITY_OWN_DEVICES)
+        {
+            bail!("当前服务端不支持客户端设备管理，请使用服务端 device 命令");
+        }
+        self.refresh_own_devices().await?;
+        self.device_manager_visible = true;
+        self.help_visible = false;
+        self.emoji_picker.visible = false;
+        self.completion = CompletionState::default();
+        self.status = "设备管理：↑/↓ 选择，x 撤销，r 刷新，Esc 关闭".to_owned();
+        Ok(())
+    }
+
+    async fn refresh_own_devices(&mut self) -> Result<()> {
+        self.dispatch_background(
+            frame(
+                Uuid::new_v4().to_string(),
+                Body::ListOwnDevices(v1::ListOwnDevices {}),
+            ),
+            BackgroundRequest::DeviceList,
+        )?;
+        self.status = "正在后台刷新设备列表…".to_owned();
+        Ok(())
+    }
+
+    fn close_device_manager(&mut self) {
+        self.device_manager_visible = false;
+        self.own_device_list_area = Rect::default();
+        self.own_device_close_area = Rect::default();
+        self.own_device_refresh_area = Rect::default();
+        self.own_device_revoke_areas.clear();
+        self.status = "已关闭设备管理".to_owned();
+    }
+
+    fn request_revoke_selected_device(&mut self) {
+        let Some(device) = self.own_devices.get(self.own_device_selected) else {
+            return;
+        };
+        if device.current {
+            self.status = "当前设备不能撤销自身".to_owned();
+            return;
+        }
+        if device.revoked {
+            self.status = "该设备已经被撤销".to_owned();
+            return;
+        }
+        self.delete_confirmation = Some(DeleteConfirmation {
+            target: DeleteTarget::Device {
+                device_id: device.device_id.clone(),
+                device_name: device.device_name.clone(),
+            },
+            confirm_selected: false,
+        });
+        self.status = format!("确认是否撤销设备 {}", device.device_name);
     }
 
     fn apply_completion(&mut self) {
@@ -2993,6 +3165,21 @@ impl App {
                 self.refresh_notifications().await?;
                 self.status = format!("已删除通知“{title}”；不会拒绝或取消对应请求");
             }
+            DeleteTarget::Device {
+                device_id,
+                device_name,
+            } => {
+                self.dispatch_background(
+                    frame(
+                        Uuid::new_v4().to_string(),
+                        Body::RevokeOwnDevice(v1::RevokeOwnDevice { device_id }),
+                    ),
+                    BackgroundRequest::DeviceRevoke {
+                        device_name: device_name.clone(),
+                    },
+                )?;
+                self.status = format!("正在后台撤销设备 {device_name}…");
+            }
         }
         self.delete_confirmation = None;
         self.delete_confirm_area = Rect::default();
@@ -3025,6 +3212,19 @@ impl App {
                 format!("确定删除通知“{}”？", sanitize_terminal_text(title)),
                 "将只删除这台设备上的通知记录。",
                 "不会拒绝会话请求，也不会取消正在进行的设备配对。",
+            ),
+            DeleteTarget::Device {
+                device_name,
+                device_id,
+            } => (
+                "撤销设备",
+                format!("确定撤销设备“{}”？", sanitize_terminal_text(device_name)),
+                "该设备会立即下线，之后无法再使用本地身份登录。",
+                if device_id.len() > 8 {
+                    "重新使用这台设备需要以新设备身份再次配对。"
+                } else {
+                    "设备撤销后不能在客户端恢复。"
+                },
             ),
         };
         let lines = vec![
@@ -3113,7 +3313,7 @@ impl App {
             Line::from("Ctrl-C / Ctrl-Q      退出"),
             Line::from(""),
             Line::from("/chat 用户名 · /emoji [关键词] · /theme [名称] · /search 关键词"),
-            Line::from("/sidebar · /verify · /pair · /confirm · /sync"),
+            Line::from("/sidebar · /devices · /verify · /pair · /confirm · /sync · /retry"),
             Line::from("/help · /exit · /quit · //文本（发送以 / 开头的正文）"),
             Line::from(""),
             Line::from(Span::styled(
@@ -3130,6 +3330,126 @@ impl App {
         );
     }
 
+    fn render_device_manager(&mut self, frame: &mut ratatui::Frame<'_>) {
+        let palette = self.theme.palette();
+        let width = frame.area().width.saturating_sub(4).min(88);
+        let height = frame.area().height.saturating_sub(2).min(20);
+        let area = centered_rect(width, height, frame.area());
+        frame.render_widget(Clear, area);
+        frame.render_widget(
+            Block::default()
+                .title("我的设备 · ↑/↓ 选择 · x 撤销")
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(palette.primary)),
+            area,
+        );
+        self.own_device_list_area = Rect::new(
+            area.x.saturating_add(1),
+            area.y.saturating_add(2),
+            area.width.saturating_sub(2),
+            area.height.saturating_sub(5),
+        );
+        self.own_device_revoke_areas.clear();
+        let visible = usize::from(self.own_device_list_area.height);
+        let start = self
+            .own_device_selected
+            .saturating_sub(visible.saturating_sub(1));
+        let label_width = usize::from(self.own_device_list_area.width.saturating_sub(2));
+        self.own_device_revoke_areas = self
+            .own_devices
+            .iter()
+            .enumerate()
+            .skip(start)
+            .take(visible)
+            .filter(|(_, device)| !device.current && !device.revoked)
+            .map(|(index, _)| {
+                (
+                    index,
+                    Rect::new(
+                        self.own_device_list_area.right().saturating_sub(1),
+                        self.own_device_list_area
+                            .y
+                            .saturating_add(index.saturating_sub(start) as u16),
+                        1,
+                        1,
+                    ),
+                )
+            })
+            .collect();
+        let items: Vec<_> = self
+            .own_devices
+            .iter()
+            .enumerate()
+            .skip(start)
+            .take(visible)
+            .map(|(index, device)| {
+                let state = if device.current {
+                    "当前"
+                } else if device.revoked {
+                    "已撤销"
+                } else if device.pending {
+                    "待批准"
+                } else if device.online {
+                    "在线"
+                } else {
+                    "离线"
+                };
+                let last_seen =
+                    chrono::DateTime::from_timestamp_millis(device.last_authenticated_at_ms)
+                        .map(|time| {
+                            time.with_timezone(&chrono::Local)
+                                .format("%m-%d %H:%M")
+                                .to_string()
+                        })
+                        .unwrap_or_else(|| "从未".to_owned());
+                let short_id = device.device_id.get(..8).unwrap_or(&device.device_id);
+                let revoke = if device.current || device.revoked {
+                    " "
+                } else {
+                    "x"
+                };
+                let label = fit_to_display_width(
+                    &format!(
+                        "{} · {} · {} · {}",
+                        sanitize_terminal_text(&device.device_name),
+                        short_id,
+                        state,
+                        last_seen
+                    ),
+                    label_width,
+                );
+                let style = if index == self.own_device_selected {
+                    Style::default()
+                        .fg(palette.selection_foreground)
+                        .bg(palette.selection_background)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(palette.text)
+                };
+                ListItem::new(Line::from(vec![Span::raw(label), Span::raw(revoke)])).style(style)
+            })
+            .collect();
+        frame.render_widget(List::new(items), self.own_device_list_area);
+
+        let button_y = area.bottom().saturating_sub(2);
+        self.own_device_refresh_area = Rect::new(area.x.saturating_add(2), button_y, 8, 1);
+        self.own_device_close_area = Rect::new(area.right().saturating_sub(10), button_y, 8, 1);
+        render_choice_button(
+            frame,
+            self.own_device_refresh_area,
+            "刷新",
+            palette.primary,
+            false,
+        );
+        render_choice_button(
+            frame,
+            self.own_device_close_area,
+            "关闭",
+            palette.primary,
+            false,
+        );
+    }
+
     async fn handle_mouse(&mut self, mouse: MouseEvent) -> Result<()> {
         if self.delete_confirmation.is_some() {
             if mouse.kind == MouseEventKind::Down(MouseButton::Left) {
@@ -3142,6 +3462,10 @@ impl App {
                     self.cancel_delete();
                 }
             }
+            return Ok(());
+        }
+        if self.device_manager_visible {
+            self.handle_device_manager_mouse(mouse).await?;
             return Ok(());
         }
         if self.emoji_picker.visible {
@@ -3296,6 +3620,45 @@ impl App {
                 } else if self.layout.messages.contains(position) {
                     self.scroll_messages(-3);
                 }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    async fn handle_device_manager_mouse(&mut self, mouse: MouseEvent) -> Result<()> {
+        let position = Position::new(mouse.column, mouse.row);
+        match mouse.kind {
+            MouseEventKind::Down(MouseButton::Left) => {
+                if self.own_device_close_area.contains(position) {
+                    self.close_device_manager();
+                } else if self.own_device_refresh_area.contains(position) {
+                    self.refresh_own_devices().await?;
+                } else if let Some(index) = self
+                    .own_device_revoke_areas
+                    .iter()
+                    .find_map(|(index, area)| area.contains(position).then_some(*index))
+                {
+                    self.own_device_selected = index;
+                    self.request_revoke_selected_device();
+                } else if self.own_device_list_area.contains(position) {
+                    let visible = usize::from(self.own_device_list_area.height);
+                    let start = self
+                        .own_device_selected
+                        .saturating_sub(visible.saturating_sub(1));
+                    let index =
+                        start + usize::from(mouse.row.saturating_sub(self.own_device_list_area.y));
+                    if index < self.own_devices.len() {
+                        self.own_device_selected = index;
+                    }
+                }
+            }
+            MouseEventKind::ScrollUp => {
+                self.own_device_selected = self.own_device_selected.saturating_sub(1);
+            }
+            MouseEventKind::ScrollDown => {
+                self.own_device_selected =
+                    (self.own_device_selected + 1).min(self.own_devices.len().saturating_sub(1));
             }
             _ => {}
         }
@@ -3638,23 +4001,18 @@ impl App {
         }
         self.messages.push(local_message);
         self.scroll_messages_to_bottom();
-        if self.rpc.request_frame(queued_frame).await.is_ok() {
-            self.store.remove_outbox(&logical_id).await?;
-            self.store
-                .update_status(&logical_id, MessageStatus::Sent)
-                .await?;
-            if let Some(message) = self
-                .messages
-                .iter_mut()
-                .find(|message| message.id == logical_id)
-            {
-                message.status = MessageStatus::Sent;
-            }
-            self.status = "消息已由服务端持久化".to_owned();
-        } else {
+        if let Err(error) = self.dispatch_background(
+            queued_frame,
+            BackgroundRequest::Outbox {
+                logical_id: logical_id.clone(),
+            },
+        ) {
             self.connected = false;
             self.reconnect_at = Instant::now();
-            self.status = "网络不可用，消息已安全保存到本地发件箱，重连后自动补发".to_owned();
+            self.status =
+                format!("网络暂不可用，消息已保存在本地发件箱，重连后自动补发：{error:#}");
+        } else {
+            self.status = "消息已保存在本地，正在后台发送".to_owned();
         }
         self.store
             .save_draft(&self.vault, &draft_conversation, "")
@@ -3953,24 +4311,13 @@ impl App {
                 }
                 self.pairing = None;
                 self.connected = false;
+                self.background_requests.clear();
+                self.background_deadlines.clear();
+                self.sync_in_flight = false;
                 self.reconnect_at = Instant::now();
-                self.status = "设备已激活，正在切换到设备签名连接".to_owned();
-                match self.reconnect_transport().await {
-                    Ok(()) => {
-                        self.connected = true;
-                        self.reconnect_backoff = 1;
-                        self.post_activation_sync = true;
-                        self.status = "设备配对成功，已自动切换到正式连接，无需重启".to_owned();
-                    }
-                    Err(error) => {
-                        self.reconnect_backoff = (self.reconnect_backoff * 2).min(30);
-                        self.reconnect_at =
-                            Instant::now() + Duration::from_secs(self.reconnect_backoff);
-                        self.status = format!(
-                            "设备已激活，无需重启；自动连接暂未成功，将继续重试：{error:#}"
-                        );
-                    }
-                }
+                self.post_activation_sync = true;
+                self.status = "设备已激活，正在后台切换到设备签名连接，无需重启".to_owned();
+                self.try_reconnect().await;
             }
             _ => {}
         }
@@ -4062,17 +4409,90 @@ impl App {
         if !self.connected {
             bail!("当前没有连接");
         }
+        if self.sync_in_flight {
+            self.status = "同步请求正在后台执行".to_owned();
+            return Ok(());
+        }
         let (cursor, status_cursor) = self.store.cursors().await?;
-        let response = self
-            .rpc
-            .request(Body::SyncRequest(SyncRequest {
+        let request = frame(
+            Uuid::new_v4().to_string(),
+            Body::SyncRequest(SyncRequest {
                 after_cursor: cursor,
                 limit: 100,
                 after_status_cursor: status_cursor,
-            }))
+            }),
+        );
+        self.dispatch_background(request, BackgroundRequest::Sync)?;
+        self.sync_in_flight = true;
+        self.status = "已在后台请求同步".to_owned();
+        Ok(())
+    }
+
+    fn dispatch_background(
+        &mut self,
+        mut request: v1::Frame,
+        operation: BackgroundRequest,
+    ) -> Result<()> {
+        if request.id.is_empty() || self.background_requests.contains_key(&request.id) {
+            request.id = Uuid::new_v4().to_string();
+        }
+        let request_id = request.id.clone();
+        self.rpc.try_send_frame(request)?;
+        self.background_requests
+            .insert(request_id.clone(), operation);
+        self.background_deadlines
+            .insert(request_id, Instant::now() + Duration::from_secs(20));
+        Ok(())
+    }
+
+    fn expire_background_requests(&mut self) {
+        let now = Instant::now();
+        let expired: Vec<_> = self
+            .background_deadlines
+            .iter()
+            .filter(|(_, deadline)| **deadline <= now)
+            .map(|(request_id, _)| request_id.clone())
+            .collect();
+        for request_id in expired {
+            self.background_deadlines.remove(&request_id);
+            match self.background_requests.remove(&request_id) {
+                Some(BackgroundRequest::Sync) => {
+                    self.sync_in_flight = false;
+                    self.status = "后台同步请求超时，将在下次同步时重试".to_owned();
+                }
+                Some(BackgroundRequest::Outbox { logical_id }) => {
+                    self.outbox_retry_after
+                        .insert(logical_id, now + Duration::from_secs(30));
+                    self.status = "后台发送请求超时，消息仍在本地发件箱中".to_owned();
+                }
+                Some(BackgroundRequest::DeviceList) => {
+                    self.status = "设备列表请求超时，请按 r 重试".to_owned();
+                }
+                Some(BackgroundRequest::DeviceRevoke { device_name }) => {
+                    self.status = format!("撤销设备 {device_name} 超时，请刷新设备列表确认状态");
+                }
+                Some(BackgroundRequest::ReconcilePairing) | None => {}
+            }
+        }
+    }
+
+    async fn complete_outbox(&mut self, logical_id: &str) -> Result<()> {
+        self.store.remove_outbox(logical_id).await?;
+        self.store
+            .mark_conversation_deletion_synced(logical_id)
             .await?;
-        self.handle_server_event(response).await?;
-        self.reconcile_pairing_notifications().await
+        self.store
+            .update_status(logical_id, MessageStatus::Sent)
+            .await?;
+        if let Some(message) = self
+            .messages
+            .iter_mut()
+            .find(|message| message.id == logical_id)
+            && message.status.rank() < MessageStatus::Sent.rank()
+        {
+            message.status = MessageStatus::Sent;
+        }
+        Ok(())
     }
 
     async fn reconcile_pairing_notifications(&mut self) -> Result<()> {
@@ -4084,8 +4504,29 @@ impl App {
         {
             return Ok(());
         }
-        let username = self.profile.username.clone();
-        let bundle = self.lookup_bundle_fresh(&username).await?;
+        if self
+            .background_requests
+            .values()
+            .any(|operation| matches!(operation, BackgroundRequest::ReconcilePairing))
+        {
+            return Ok(());
+        }
+        self.dispatch_background(
+            frame(
+                Uuid::new_v4().to_string(),
+                Body::LookupUser(v1::LookupUser {
+                    exact_username: self.profile.username.clone(),
+                }),
+            ),
+            BackgroundRequest::ReconcilePairing,
+        )?;
+        Ok(())
+    }
+
+    async fn reconcile_pairing_notifications_from_bundle(
+        &mut self,
+        bundle: UserBundle,
+    ) -> Result<()> {
         validate_bundle(&bundle)?;
         if bundle.account_id != self.profile.account_id
             || bundle.account_master_key != self.profile.account_master_public
@@ -4128,8 +4569,51 @@ impl App {
     }
 
     async fn handle_server_event(&mut self, frame: v1::Frame) -> Result<()> {
+        let pending = if frame.id.is_empty() {
+            None
+        } else {
+            self.background_deadlines.remove(&frame.id);
+            self.background_requests.remove(&frame.id)
+        };
         match frame.body {
-            Some(Body::SyncBatch(batch)) => self.handle_sync_batch(batch).await?,
+            Some(Body::SyncBatch(batch)) => {
+                if matches!(pending.as_ref(), Some(BackgroundRequest::Sync))
+                    || !self
+                        .background_requests
+                        .values()
+                        .any(|operation| matches!(operation, BackgroundRequest::Sync))
+                {
+                    self.sync_in_flight = false;
+                }
+                self.handle_sync_batch(batch).await?;
+            }
+            Some(Body::SendAccepted(accepted)) => {
+                self.blocked_outbox.remove(&accepted.logical_message_id);
+                self.outbox_retry_after.remove(&accepted.logical_message_id);
+                self.complete_outbox(&accepted.logical_message_id).await?;
+                self.status = "消息已由服务端持久化".to_owned();
+            }
+            Some(Body::OwnDeviceList(list)) => {
+                self.own_devices = list.devices;
+                self.own_device_selected = self
+                    .own_device_selected
+                    .min(self.own_devices.len().saturating_sub(1));
+                self.device_manager_visible = true;
+                self.status = match pending.as_ref() {
+                    Some(BackgroundRequest::DeviceRevoke { device_name }) => {
+                        format!("已撤销设备 {device_name}")
+                    }
+                    _ => "设备列表已刷新".to_owned(),
+                };
+            }
+            Some(Body::UserBundle(bundle))
+                if matches!(pending.as_ref(), Some(BackgroundRequest::ReconcilePairing)) =>
+            {
+                self.bundle_cache
+                    .insert(bundle.username.clone(), (bundle.clone(), Instant::now()));
+                self.reconcile_pairing_notifications_from_bundle(bundle)
+                    .await?;
+            }
             Some(Body::DeliveryUpdate(update)) => {
                 self.store
                     .update_status(&update.logical_message_id, MessageStatus::Delivered)
@@ -4180,12 +4664,44 @@ impl App {
                 }
             }
             Some(Body::Error(error)) => {
+                if matches!(pending.as_ref(), Some(BackgroundRequest::Sync)) {
+                    self.sync_in_flight = false;
+                }
+                if let Some(BackgroundRequest::Outbox { logical_id }) = pending.as_ref() {
+                    if error.retryable {
+                        self.outbox_retry_after
+                            .insert(logical_id.clone(), Instant::now() + Duration::from_secs(30));
+                    } else {
+                        self.outbox_retry_after.remove(logical_id);
+                        self.blocked_outbox.insert(logical_id.clone());
+                    }
+                }
                 if error.code == "connection_closed" {
                     self.connected = false;
+                    self.sync_in_flight = false;
+                    self.background_requests.clear();
+                    self.background_deadlines.clear();
                     self.reconnect_at =
                         Instant::now() + Duration::from_secs(self.reconnect_backoff);
                 }
-                self.status = format!("{}: {}", error.code, error.message);
+                self.status = match pending {
+                    Some(BackgroundRequest::Outbox { logical_id }) => {
+                        let retry_hint = if error.retryable {
+                            "将自动重试"
+                        } else {
+                            "已暂停自动重试，可在问题解决后输入 /retry"
+                        };
+                        format!(
+                            "消息 {logical_id} 仍保存在本地发件箱（{retry_hint}）：{}: {}",
+                            error.code, error.message
+                        )
+                    }
+                    Some(BackgroundRequest::DeviceRevoke { device_name }) => format!(
+                        "撤销设备 {device_name} 失败：{}: {}",
+                        error.code, error.message
+                    ),
+                    _ => format!("{}: {}", error.code, error.message),
+                };
             }
             _ => {}
         }
@@ -4812,9 +5328,12 @@ impl App {
             self.profile.machine = previous_machine;
             return Err(error);
         }
-        if self.rpc.request_frame(queued_frame).await.is_ok() {
-            self.store.remove_outbox(&logical).await?;
-        }
+        self.dispatch_background(
+            queued_frame,
+            BackgroundRequest::Outbox {
+                logical_id: logical,
+            },
+        )?;
         Ok(())
     }
 
@@ -4946,9 +5465,12 @@ impl App {
             self.profile.machine = previous_machine;
             return Err(error);
         }
-        if self.rpc.request_frame(queued_frame).await.is_ok() {
-            self.store.remove_outbox(&request_id).await?;
-        }
+        self.dispatch_background(
+            queued_frame,
+            BackgroundRequest::Outbox {
+                logical_id: request_id,
+            },
+        )?;
         self.status = format!("已向 {} 发出会话请求，等待对方确认", recipient.username);
         Ok(())
     }
@@ -5049,9 +5571,7 @@ impl App {
             self.profile.machine = previous_machine;
             return Err(error);
         }
-        if self.rpc.request_frame(queued_frame).await.is_ok() {
-            self.store.remove_outbox(&logical_id).await?;
-        }
+        self.dispatch_background(queued_frame, BackgroundRequest::Outbox { logical_id })?;
         Ok(())
     }
 
@@ -5149,11 +5669,12 @@ impl App {
                 self.profile.machine = previous_machine;
                 return Err(error);
             }
-            self.rpc.request_frame(queued_frame).await?;
-            self.store.remove_outbox(&tombstone.sync_event_id).await?;
-            self.store
-                .mark_conversation_deletion_synced(&tombstone.sync_event_id)
-                .await?;
+            self.dispatch_background(
+                queued_frame,
+                BackgroundRequest::Outbox {
+                    logical_id: tombstone.sync_event_id.clone(),
+                },
+            )?;
             synced += 1;
         }
         Ok(synced)
@@ -5163,94 +5684,115 @@ impl App {
         let Ok(items) = self.store.outbox().await else {
             return;
         };
+        let now = Instant::now();
+        self.outbox_retry_after
+            .retain(|_, retry_at| *retry_at > now);
         for (logical_id, encoded) in items {
-            let result = match decode_frame(&encoded) {
-                Ok(frame) => self.rpc.request_frame(frame).await.map(|_| ()),
-                Err(error) => Err(error.into()),
-            };
-            if result.is_ok() {
-                let _ = self.store.remove_outbox(&logical_id).await;
-                let _ = self
-                    .store
-                    .mark_conversation_deletion_synced(&logical_id)
-                    .await;
-                let _ = self
-                    .store
-                    .update_status(&logical_id, MessageStatus::Sent)
-                    .await;
+            if self.blocked_outbox.contains(&logical_id)
+                || self.outbox_retry_after.contains_key(&logical_id)
+            {
+                continue;
+            }
+            if self.background_requests.values().any(|operation| {
+                matches!(
+                    operation,
+                    BackgroundRequest::Outbox {
+                        logical_id: pending
+                    } if pending == &logical_id
+                )
+            }) {
+                continue;
+            }
+            let result = decode_frame(&encoded)
+                .map_err(anyhow::Error::from)
+                .and_then(|request| {
+                    self.dispatch_background(
+                        request,
+                        BackgroundRequest::Outbox {
+                            logical_id: logical_id.clone(),
+                        },
+                    )
+                });
+            if let Err(error) = result {
+                self.status = format!("本地发件箱等待重试：{error:#}");
             }
         }
     }
 
     async fn try_reconnect(&mut self) {
+        if self.reconnect_in_flight {
+            return;
+        }
         if self.profile.pending {
             self.status = "设备仍在等待批准；请保持客户端运行以继续配对".to_owned();
             self.reconnect_at = Instant::now() + Duration::from_secs(30);
             return;
         }
-        match self.reconnect_transport().await {
-            Ok(()) => {
+        let identity = match self.profile.identity.to_bytes() {
+            Ok(identity) => identity,
+            Err(error) => {
+                self.status = format!("准备重连身份失败：{error:#}");
+                return;
+            }
+        };
+        let input = ReconnectInput {
+            server_url: self.profile.server_url.clone(),
+            spki_pin: self.profile.spki_pin.clone(),
+            username: self.profile.username.clone(),
+            account_id: self.profile.account_id.clone(),
+            account_master_public: self.profile.account_master_public.clone(),
+            device_id: self.profile.identity.device_id().to_owned(),
+            identity,
+        };
+        let tx = self.reconnect_tx.clone();
+        self.reconnect_in_flight = true;
+        self.status = "正在后台重新连接…".to_owned();
+        tokio::spawn(async move {
+            let result = establish_reconnect(input)
+                .await
+                .map_err(|error| format!("{error:#}"));
+            let _ = tx.send(result).await;
+        });
+    }
+
+    async fn handle_reconnect_result(
+        &mut self,
+        result: std::result::Result<ReconnectTransport, String>,
+    ) {
+        self.reconnect_in_flight = false;
+        match result {
+            Ok(transport) => {
+                self.rpc = transport.rpc;
+                self.events = transport.events;
+                self.profile.server_capabilities = transport.server_capabilities;
                 self.connected = true;
                 self.reconnect_backoff = 1;
-                self.status = "已重新连接，正在补拉离线消息".to_owned();
+                let activated = self.post_activation_sync;
+                self.post_activation_sync = false;
+                let profile_save_error = self
+                    .store
+                    .save_profile(&self.vault, &self.profile)
+                    .await
+                    .err();
+                self.status = "已重新连接，正在后台补拉离线消息".to_owned();
                 self.resend_outbox().await;
                 let _ = self.sync_pending_conversation_deletions().await;
                 let _ = self.sync().await;
+                if let Some(error) = profile_save_error {
+                    self.status = format!("重连成功，但保存服务端能力失败：{error:#}");
+                } else if activated {
+                    self.status = "设备配对成功，已自动切换到正式连接，无需重启".to_owned();
+                }
             }
             Err(error) => {
-                self.status = format!("重连失败：{error:#}");
+                self.connected = false;
+                self.status = format!("重连失败：{error}");
                 self.reconnect_backoff = (self.reconnect_backoff * 2).min(30);
                 let jitter = u64::from(Uuid::new_v4().as_bytes()[0] % 3);
                 self.reconnect_at =
                     Instant::now() + Duration::from_secs(self.reconnect_backoff + jitter);
             }
         }
-    }
-
-    async fn reconnect_transport(&mut self) -> Result<()> {
-        let mut raw =
-            RawConnection::connect(&self.profile.server_url, self.profile.spki_pin.as_deref())
-                .await?;
-        let response = raw
-            .request(Body::ClientHello(v1::ClientHello {
-                username: self.profile.username.clone(),
-                device_id: self.profile.identity.device_id().to_owned(),
-            }))
-            .await?;
-        let Some(Body::AuthChallenge(challenge)) = response.body else {
-            bail!("重连握手缺少挑战");
-        };
-        let host = url::Url::parse(&self.profile.server_url)?
-            .host_str()
-            .ok_or_else(|| anyhow!("服务器 URL 缺少主机名"))?
-            .to_owned();
-        let payload = tui_chat_protocol::auth_challenge_payload(
-            &host,
-            &self.profile.username,
-            self.profile.identity.device_id(),
-            &challenge.nonce,
-            challenge.expires_at_ms,
-        );
-        let response = raw
-            .request(Body::DeviceAuth(v1::DeviceAuth {
-                username: self.profile.username.clone(),
-                device_id: self.profile.identity.device_id().to_owned(),
-                signature: self.profile.identity.sign_auth_challenge(&payload),
-            }))
-            .await?;
-        let Some(Body::Authenticated(auth)) = response.body else {
-            bail!("重连认证失败");
-        };
-        if auth.pending_device
-            || auth.account_id != self.profile.account_id
-            || auth.account_master_key != self.profile.account_master_public
-        {
-            bail!("重连时账号或设备状态发生变化");
-        }
-        let (rpc, events) = raw.start();
-        self.rpc = rpc;
-        self.events = events;
-        Ok(())
     }
 
     async fn select_relative(&mut self, direction: isize) -> Result<()> {
@@ -5435,6 +5977,55 @@ fn validate_bundle(bundle: &UserBundle) -> Result<()> {
 
 fn now_ms() -> i64 {
     chrono::Utc::now().timestamp_millis()
+}
+
+async fn establish_reconnect(input: ReconnectInput) -> Result<ReconnectTransport> {
+    let identity = tui_chat_crypto::DeviceIdentity::from_bytes(&input.identity)?;
+    let mut raw = RawConnection::connect(&input.server_url, input.spki_pin.as_deref()).await?;
+    let response = raw
+        .request(Body::ClientHello(v1::ClientHello {
+            username: input.username.clone(),
+            device_id: input.device_id.clone(),
+            capabilities: tui_chat_protocol::client_capabilities(),
+        }))
+        .await?;
+    let Some(Body::AuthChallenge(challenge)) = response.body else {
+        bail!("重连握手缺少挑战");
+    };
+    let host = url::Url::parse(&input.server_url)?
+        .host_str()
+        .ok_or_else(|| anyhow!("服务器 URL 缺少主机名"))?
+        .to_owned();
+    let payload = tui_chat_protocol::auth_challenge_payload(
+        &host,
+        &input.username,
+        &input.device_id,
+        &challenge.nonce,
+        challenge.expires_at_ms,
+    );
+    let response = raw
+        .request(Body::DeviceAuth(v1::DeviceAuth {
+            username: input.username,
+            device_id: input.device_id,
+            signature: identity.sign_auth_challenge(&payload),
+        }))
+        .await?;
+    let Some(Body::Authenticated(auth)) = response.body else {
+        bail!("重连认证失败");
+    };
+    if auth.pending_device
+        || auth.account_id != input.account_id
+        || auth.account_master_key != input.account_master_public
+    {
+        bail!("重连时账号或设备状态发生变化");
+    }
+    let server_capabilities = auth.capabilities;
+    let (rpc, events) = raw.start();
+    Ok(ReconnectTransport {
+        rpc,
+        events,
+        server_capabilities,
+    })
 }
 
 fn sanitize_terminal_text(text: &str) -> Cow<'_, str> {

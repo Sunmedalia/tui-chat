@@ -2,8 +2,8 @@ use std::{io::Write as _, path::Path};
 
 use anyhow::{Context, Result, bail};
 use argon2::{
-    Argon2, PasswordHasher,
-    password_hash::{SaltString, rand_core::OsRng},
+    Algorithm, Argon2, Params, PasswordHasher, Version,
+    password_hash::{PasswordHash, SaltString, rand_core::OsRng},
 };
 use rand::{Rng, distributions::Alphanumeric};
 use serde::Serialize;
@@ -51,10 +51,27 @@ pub fn validate_password(password: &str) -> Result<()> {
 
 pub fn hash_password(password: &str) -> Result<String> {
     validate_password(password)?;
-    Ok(Argon2::default()
+    Ok(password_hasher()?
         .hash_password(password.as_bytes(), &SaltString::generate(&mut OsRng))
         .map_err(|error| anyhow::anyhow!(error.to_string()))?
         .to_string())
+}
+
+pub fn password_hasher() -> Result<Argon2<'static>> {
+    let params =
+        Params::new(19 * 1024, 2, 1, None).map_err(|error| anyhow::anyhow!(error.to_string()))?;
+    Ok(Argon2::new(Algorithm::Argon2id, Version::V0x13, params))
+}
+
+pub fn password_needs_rehash(phc: &str) -> bool {
+    let Ok(hash) = PasswordHash::new(phc) else {
+        return true;
+    };
+    hash.algorithm.as_str() != "argon2id"
+        || hash.version != Some(0x13)
+        || hash.params.get_decimal("m") != Some(19 * 1024)
+        || hash.params.get_decimal("t") != Some(2)
+        || hash.params.get_decimal("p") != Some(1)
 }
 
 pub async fn add_user(db: &Db, username: &str, generate: bool) -> Result<()> {
@@ -205,6 +222,11 @@ pub async fn reset_devices(db: &Db, username: &str) -> Result<()> {
     let Some(account_id) = account_id else {
         bail!("account not found");
     };
+    let device_ids: Vec<String> =
+        sqlx::query_scalar("SELECT id FROM devices WHERE account_id = ? AND revoked = 0")
+            .bind(&account_id)
+            .fetch_all(&mut *tx)
+            .await?;
     sqlx::query("UPDATE devices SET revoked = 1 WHERE account_id = ?")
         .bind(&account_id)
         .execute(&mut *tx)
@@ -218,6 +240,9 @@ pub async fn reset_devices(db: &Db, username: &str) -> Result<()> {
     sqlx::query("UPDATE accounts SET master_public_key = NULL, identity_generation = identity_generation + 1, roster_revision = 0 WHERE id = ?")
         .bind(&account_id).execute(&mut *tx).await?;
     tx.commit().await?;
+    for device_id in device_ids {
+        db.cleanup_revoked_device(&device_id).await?;
+    }
     db.audit(
         "admin",
         "local-admin",
@@ -279,13 +304,20 @@ pub async fn revoke_device(db: &Db, username: &str, device_id: &str) -> Result<(
     if affected != 1 {
         bail!("device not found");
     }
+    let cleanup = db.cleanup_revoked_device(device_id).await?;
     db.audit(
         "admin",
         "local-admin",
         "device_revoke",
         device_id,
         "success",
-        (None, &account.username),
+        (
+            None,
+            &format!(
+                "account={},removed_envelopes={},removed_bytes={}",
+                account.username, cleanup.envelopes, cleanup.ciphertext_bytes
+            ),
+        ),
     )
     .await?;
     println!("revoked {device_id}; clients will reject it on their next roster refresh");
@@ -300,6 +332,7 @@ pub async fn backup(db: &Db, path: &Path) -> Result<()> {
     sqlx::query(&format!("VACUUM INTO '{escaped}'"))
         .execute(db.pool())
         .await?;
+    harden_backup_permissions(path).await?;
     db.audit(
         "admin",
         "local-admin",
@@ -310,6 +343,19 @@ pub async fn backup(db: &Db, path: &Path) -> Result<()> {
     )
     .await?;
     println!("wrote consistent SQLite backup to {}", path.display());
+    Ok(())
+}
+
+#[cfg(unix)]
+async fn harden_backup_permissions(path: &Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    tokio::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).await?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+async fn harden_backup_permissions(_path: &Path) -> Result<()> {
     Ok(())
 }
 
@@ -329,6 +375,71 @@ pub async fn checkpoint(db: &Db) -> Result<()> {
         .execute(db.pool())
         .await?;
     println!("database WAL checkpoint completed");
+    Ok(())
+}
+
+pub async fn storage_status(
+    db: &Db,
+    limits: crate::db::StorageLimits,
+    output: OutputFormat,
+) -> Result<()> {
+    let status = db.storage_status(limits).await?;
+    if matches!(output, OutputFormat::Json) {
+        println!("{}", serde_json::to_string_pretty(&status)?);
+    } else {
+        println!("ciphertext_bytes\t{}", status.ciphertext_bytes);
+        println!("account_limit_bytes\t{}", status.account_limit_bytes);
+        println!("total_limit_bytes\t{}", status.total_limit_bytes);
+        println!("free_disk_bytes\t{}", status.free_disk_bytes);
+        println!(
+            "minimum_free_disk_bytes\t{}",
+            status.minimum_free_disk_bytes
+        );
+    }
+    Ok(())
+}
+
+pub async fn cleanup_storage(db: &Db, retention_days: u32, yes: bool) -> Result<()> {
+    let cutoff =
+        chrono::Utc::now().timestamp_millis() - i64::from(retention_days) * 24 * 60 * 60 * 1000;
+    let preview = sqlx::query(
+        "SELECT COUNT(*) AS envelopes, COALESCE(SUM(length(ciphertext)), 0) AS ciphertext_bytes
+         FROM envelopes WHERE delivered_at_ms IS NOT NULL AND delivered_at_ms < ?",
+    )
+    .bind(cutoff)
+    .fetch_one(db.pool())
+    .await?;
+    let preview = serde_json::json!({
+        "delivered_before_ms": cutoff,
+        "envelopes": preview.get::<i64, _>("envelopes"),
+        "ciphertext_bytes": preview.get::<i64, _>("ciphertext_bytes"),
+    });
+    println!("{}", serde_json::to_string_pretty(&preview)?);
+    if !yes {
+        println!("dry-run only; repeat with --yes to delete these records");
+        return Ok(());
+    }
+    let mut total = crate::db::CleanupStats::default();
+    loop {
+        let batch = db.cleanup_delivered_envelopes(cutoff, 1000).await?;
+        total.envelopes += batch.envelopes;
+        total.ciphertext_bytes += batch.ciphertext_bytes;
+        total.logical_messages += batch.logical_messages;
+        total.delivery_updates += batch.delivery_updates;
+        if batch.envelopes < 1000 {
+            break;
+        }
+    }
+    db.audit(
+        "admin",
+        "local-admin",
+        "storage_cleanup",
+        "delivered_envelopes",
+        "success",
+        (None, &serde_json::to_string(&total)?),
+    )
+    .await?;
+    println!("{}", serde_json::to_string_pretty(&total)?);
     Ok(())
 }
 
@@ -641,6 +752,25 @@ async fn delete_user_records(db: &Db, account_id: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn password_hash_policy_is_explicit_and_upgradeable() -> Result<()> {
+        let current = hash_password("a sufficiently long password")?;
+        assert!(!password_needs_rehash(&current));
+
+        let weak_params =
+            Params::new(4096, 1, 1, None).map_err(|error| anyhow::anyhow!(error.to_string()))?;
+        let weak = Argon2::new(Algorithm::Argon2id, Version::V0x13, weak_params)
+            .hash_password(
+                b"a sufficiently long password",
+                &SaltString::generate(&mut OsRng),
+            )
+            .map_err(|error| anyhow::anyhow!(error.to_string()))?
+            .to_string();
+        assert!(password_needs_rehash(&weak));
+        assert!(password_needs_rehash("not-a-password-hash"));
+        Ok(())
+    }
 
     #[tokio::test]
     async fn deleting_user_removes_related_data_but_keeps_other_account() -> Result<()> {

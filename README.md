@@ -11,7 +11,7 @@
 [![Rust 1.95](https://img.shields.io/badge/Rust-1.95-dea584?logo=rust)](https://www.rust-lang.org/)
 [![License](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue)](#许可证)
 
-[快速开始](#本地快速开始) · [操作指南](#tui-操作) · [公网部署](#docker-公网部署) · [服务端管理](#服务端管理) · [下载 Release](https://github.com/Sunmedalia/tui-chat/releases/latest)
+[快速开始](#本地快速开始) · [操作指南](#tui-操作) · [公网部署](#docker-公网部署) · [服务端管理](#服务端管理) · [安全策略](SECURITY.md) · [下载 Release](https://github.com/Sunmedalia/tui-chat/releases/latest)
 
 </div>
 
@@ -42,10 +42,10 @@
 | 聊天 | 一对一文字聊天、离线消息、密文历史自动补拉 |
 | 状态 | 发送中、已发送、已送达、已读；只有接收端窗口聚焦时才发送已读回执 |
 | 端到端加密 | 每台设备拥有独立身份密钥和 Olm 预密钥，消息按设备加密 |
-| 多设备 | 已有设备通过 SAS 短认证码批准新设备；成功后自动热切换，且会话请求、处理结果和删除状态跨设备同步 |
-| 本地保护 | 消息、草稿、Olm 状态和私钥由随机 VaultKey 加密，Argon2id 用于解锁 |
-| 网络安全 | 强制公网使用 WSS、系统 CA 校验、可选 SPKI 公钥固定 |
-| 稳定性 | 持久化 outbox、同步游标、离线补拉、心跳和指数退避重连 |
+| 多设备 | 已有设备通过 SAS 短认证码批准新设备；成功后自动热切换；客户端可查看并吊销自己的其他设备 |
+| 本地保护 | 消息、草稿、Olm 状态和私钥由随机 VaultKey 加密，Argon2id 用于解锁；Unix 数据目录和数据库自动收紧权限 |
+| 网络安全 | 强制公网使用 WSS、系统 CA 校验、可选 SPKI 公钥固定、受信代理 CIDR 和浏览器 Origin 拒绝策略 |
+| 稳定性 | 持久化 outbox、同步游标、离线补拉、心跳、后台请求和带抖动的指数退避重连 |
 | TUI | Unicode/Emoji、可持久化主题、可收起侧边栏、命令补全、鼠标操作、加密草稿、分页历史和响应式布局 |
 | 管理 | 账号仅由管理员创建；支持用户、设备、在线会话、密文和备份管理 |
 
@@ -276,6 +276,8 @@ tui-chat --help
 
 部分终端无法区分 `Enter` 与 `Shift-Enter`。这种情况下可以直接粘贴多行文本，客户端已启用 bracketed paste。
 
+执行 `/devices` 可打开当前账号的设备管理弹窗。使用 `↑` / `↓`、鼠标滚轮或点击选择设备，按 `x` / `Delete` 或点击行尾 `x` 后二次确认吊销；当前设备不能在自己的连接中吊销。被吊销设备会立即下线，其待收密文和预密钥会从服务端清理。
+
 ### 鼠标
 
 - 点击会话以打开聊天。
@@ -312,16 +314,18 @@ tui-chat --help
 | `/emoji [关键词]` | 打开 Unicode Emoji 选择器并可选地预填搜索词 |
 | `/theme [名称]` | 查看当前主题，或切换到 `default` / `terminal` 并保存到本机 |
 | `/sidebar [hide\|show\|toggle]` | 切换、收起或展开会话侧边栏，并保存到本机 |
+| `/devices` | 查看设备、在线/待批准状态和最近认证时间，并可吊销其他设备 |
 | `/search <关键词>` | 在当前已分页加载的消息中搜索 |
 | `/verify` | 核验当前联系人的安全码 |
 | `/pair [设备ID]` | 已有设备开始批准新设备 |
 | `/confirm` | 确认当前设备配对的 SAS 短认证码 |
 | `/sync` | 继续补拉服务端历史 |
+| `/retry` | 重新启用因不可重试服务端错误而暂停的本地发件箱消息 |
 | `/help` | 打开快捷键帮助 |
 | `/exit` / `/quit` | 安全退出 |
 | `//文本` | 发送以 `/` 开头的普通消息 |
 
-输入 `/` 后可以使用 `Tab` 补全命令。`/chat` 会补全已有联系人，`/pair` 会补全待处理设备，`/theme` 会补全主题名称，`/sidebar` 会补全侧边栏操作。
+输入 `/` 后可以使用 `Tab` 补全命令。`/chat` 会补全已有联系人，`/pair` 会补全待处理设备，`/theme` 会补全主题名称，`/sidebar` 会补全侧边栏操作。消息在本地持久化后的提交、同步、发件箱补发、设备列表和重连均在后台进行，慢网络下的日常操作不会阻塞键盘、鼠标和重绘。
 
 执行 `/chat 用户名` 后，接收方会在通知 Tab 看到会话请求。按 `Enter` 或点击“接受”后仍停留在通知页，双方都能在通知详情看到安全码。通过电话、当面等可信渠道确认完全一致后，点击“已核对，认证”或按 `Enter` 完成认证；也可以继续使用 `/verify`。在联系人显示 `✓` 前不会发送聊天正文。接收方离线时请求会由服务端暂存，重新连接后仍会出现。发起请求和接受/拒绝结果会端到端同步到同账号的其他已激活设备，任何一台设备处理后，其他设备上的通知状态也会更新。
 
@@ -367,8 +371,12 @@ Compose 中：
 - Rust 服务只位于内部 Docker 网络。
 - 服务端数据库保存在 `chat-data` volume。
 - Caddy 数据保存在 `caddy-data` 和 `caddy-config` volume。
-- 对公网只接受 `/v2/ws`；`/healthz` 仅在容器内部用于健康检查。
-- Rust 进程校验 Caddy 转发的 TLS 标记，并且容器使用只读根文件系统、无 Linux capabilities、进程/内存上限和日志轮转。
+- 对公网只接受 `/v2/ws`；`/healthz` 是进程存活探针，`/readyz` 还会检查 SQLite，二者仅在容器内部使用。
+- Caddy 在固定的内部子网地址连接 Rust 服务；Rust 进程只信任该地址传来的 `X-Forwarded-*`，并拒绝带浏览器 `Origin` 的 WebSocket 请求。
+- 基础镜像默认固定到多架构摘要；容器使用只读根文件系统、无多余 Linux capabilities、进程/内存上限和日志轮转。
+- 默认每账号最多保存 512 MiB 密文、全局最多 10 GiB，并预留 1 GiB 磁盘空间；可通过同名 `TUI_CHAT_*` 环境变量调整。
+
+如果宿主机已有网络占用了 `172.31.250.0/24`，请同时修改 `compose.yaml` 中的 backend 子网、Caddy/Server 静态地址和 `TUI_CHAT_TRUSTED_PROXY_CIDRS`；四处必须保持一致，不能只扩大为任意来源。
 
 创建账号：
 
@@ -455,9 +463,16 @@ docker compose exec -it server tui-chat-server admin
 docker compose exec server tui-chat-server db backup /data/backup.db
 docker compose exec server tui-chat-server db check
 docker compose exec server tui-chat-server db checkpoint
+
+# 查看配额、实际密文占用和磁盘余量
+docker compose exec server tui-chat-server storage status
+
+# 预览或执行按保留期清理
+docker compose exec server tui-chat-server storage cleanup
+docker compose exec server tui-chat-server storage cleanup --yes
 ```
 
-管理 TUI/CLI 只通过 `/data/admin.sock` Unix socket 获取在线状态，不存在公网管理 HTTP API。默认保留 90 天审计事件；服务端密文不自动过期，只能由管理员显式预览后清理。
+管理 TUI/CLI 只通过 `/data/admin.sock` Unix socket 获取在线状态，不存在公网管理 HTTP API。默认保留 90 天审计事件；已投递密文默认保留 90 天并由后台分批清理，未投递密文会保留到成功投递、目标设备被吊销、账号删除或管理员显式清理。`storage cleanup` 默认只预览，必须增加 `--yes` 才执行。
 
 `session list`、`conversation list` 和 `admin` 需要正在运行的服务端及其 Unix socket。纯数据库命令，例如 `user list`、`db check` 和 `db backup`，可直接读取配置的 SQLite 数据库。
 
@@ -482,6 +497,8 @@ docker compose exec -it server tui-chat-server user delete alice \
 - SQLite 使用 WAL。
 - 服务端先提交密文，再返回发送成功。
 - 逻辑消息和逐设备信封使用稳定 UUID，重复投递不会重复入库。
+- 写入前检查账号/全局密文配额和磁盘预留空间；重复提交同一信封不会重复计费。
+- 数据目录自动使用 `0700`，SQLite、WAL、SHM 和管理备份使用 `0600`（Unix）。
 - 使用 `tui-chat-server db backup` 创建一致性备份，不要只复制正在写入的主数据库文件。
 
 ### 客户端
@@ -491,6 +508,7 @@ docker compose exec -it server tui-chat-server user delete alice \
 - 接收时原子保存棘轮状态、加密正文和同步游标。
 - 可以在客户端完全退出后备份整个 `--data-dir`。
 - 恢复客户端备份必须拥有对应本地口令。
+- 客户端数据目录自动使用 `0700`，SQLite、WAL、SHM 和迁移备份使用 `0600`（Unix）。
 
 旧版客户端数据库首次升级时会生成：
 
@@ -564,6 +582,10 @@ client.db.pre-v2-时间.bak
 
 配对完成后客户端会自动切换到正式连接。如果网络此时不可用，状态栏会显示重试信息，并继续指数退避重连；不需要重启客户端或再次输入账号密码。
 
+### 消息提示存储配额错误
+
+消息仍安全保存在当前设备的加密 outbox。不可重试的配额错误会暂停该消息的自动补发，避免形成重试风暴；管理员清理空间或提高配额后，执行 `/retry` 重新发送。磁盘预留空间不足属于可重试错误，客户端会在后续重连或补发周期继续尝试。
+
 ### 鼠标无法选择终端文字
 
 使用 `--no-mouse` 启动，或者尝试按住终端支持的鼠标绕过修饰键，通常是 `Shift`。
@@ -581,15 +603,22 @@ cargo clippy --workspace --all-targets --locked -- -D warnings
 cargo build --release --locked -p tui-chat-server -p tui-chat
 ```
 
-CI 还会执行依赖许可证、来源和安全公告策略检查，并为 Linux、macOS 和 Windows 构建客户端产物。
+CI 还会执行依赖许可证、来源和安全公告策略检查，实际构建并冒烟检查服务端容器，并为 Linux、macOS 和 Windows 构建客户端产物。第三方 Action 固定到完整提交 SHA，Dependabot 每周检查 Cargo、Actions 和 Docker 更新。
 
 ## 发布客户端
 
-推送版本标签后，GitHub Actions 会构建并发布 Linux x86_64、macOS Intel、macOS Apple Silicon 和 Windows x86_64 客户端压缩包，同时生成 SHA-256 校验文件。Intel 构建使用 `macos-15-intel` runner：
+推送版本标签后，GitHub Actions 会构建并发布 Linux x86_64、macOS Intel、macOS Apple Silicon 和 Windows x86_64 客户端压缩包，同时生成 SHA-256 校验文件、CycloneDX JSON SBOM 压缩包和 GitHub build provenance attestation。Intel 构建使用 `macos-15-intel` runner：
 
 ```console
-git tag v0.2.1
-git push origin v0.2.1
+git tag v0.3.0
+git push origin v0.3.0
+```
+
+下载后先核验旁边的 `.sha256`。公开仓库的发布资产还可以使用 GitHub CLI 验证构建来源：
+
+```console
+gh attestation verify tui-chat-linux-x86_64.tar.gz \
+  --repo Sunmedalia/tui-chat
 ```
 
 ## 当前限制

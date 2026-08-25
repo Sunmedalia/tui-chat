@@ -3,8 +3,8 @@ services:
     build:
       context: .
       args:
-        RUST_BASE: ${TUI_CHAT_RUST_BASE:-rust:1.95.0-bookworm}
-        RUNTIME_BASE: ${TUI_CHAT_RUNTIME_BASE:-debian:bookworm-slim}
+        RUST_BASE: ${TUI_CHAT_RUST_BASE:-rust:1.95.0-bookworm@sha256:6258907abe69656e41cd992e0b705cdcfabcbbe3db374f92ed2d47121282d4a1}
+        RUNTIME_BASE: ${TUI_CHAT_RUNTIME_BASE:-debian:bookworm-slim@sha256:88200866dfff7ea7f5cbcb6ec7c8a701889efe6fe859fe64d6990e4b07ea4171}
     restart: unless-stopped
     init: true
     environment:
@@ -13,10 +13,18 @@ services:
       TUI_CHAT_ADMIN_SOCKET_PATH: /data/admin.sock
       TUI_CHAT_PUBLIC_DOMAIN: ${CHAT_DOMAIN:?set CHAT_DOMAIN}
       TUI_CHAT_TRUSTED_PROXY_TLS: "true"
+      TUI_CHAT_TRUSTED_PROXY_CIDRS: 172.31.250.2/32
+      TUI_CHAT_REJECT_WEBSOCKET_ORIGINS: "true"
+      TUI_CHAT_DELIVERED_RETENTION_DAYS: ${TUI_CHAT_DELIVERED_RETENTION_DAYS:-90}
+      TUI_CHAT_MAX_ACCOUNT_CIPHERTEXT_BYTES: ${TUI_CHAT_MAX_ACCOUNT_CIPHERTEXT_BYTES:-536870912}
+      TUI_CHAT_MAX_TOTAL_CIPHERTEXT_BYTES: ${TUI_CHAT_MAX_TOTAL_CIPHERTEXT_BYTES:-10737418240}
+      TUI_CHAT_MIN_FREE_DISK_BYTES: ${TUI_CHAT_MIN_FREE_DISK_BYTES:-1073741824}
       RUST_LOG: tui_chat_server=info
     volumes:
       - chat-data:/data
-    networks: [backend]
+    networks:
+      backend:
+        ipv4_address: 172.31.250.3
     healthcheck:
       test: ["CMD", "tui-chat-server", "healthcheck"]
       interval: 30s
@@ -36,7 +44,7 @@ services:
         max-file: "3"
 
   caddy:
-    image: caddy:2.10-alpine
+    image: ${TUI_CHAT_CADDY_IMAGE:-caddy:2.10-alpine@sha256:4c6e91c6ed0e2fa03efd5b44747b625fec79bc9cd06ac5235a779726618e530d}
     restart: unless-stopped
     init: true
     environment:
@@ -48,7 +56,10 @@ services:
       - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
       - caddy-data:/data
       - caddy-config:/config
-    networks: [frontend, backend]
+    networks:
+      frontend:
+      backend:
+        ipv4_address: 172.31.250.2
     depends_on:
       server:
         condition: service_healthy
@@ -70,6 +81,9 @@ networks:
   frontend:
   backend:
     internal: true
+    ipam:
+      config:
+        - subnet: 172.31.250.0/24
 
 volumes:
   chat-data:

@@ -59,6 +59,7 @@ pub struct RuntimeProfile {
     pub pairing_secret: Option<[u8; 32]>,
     pub account_master_public: Vec<u8>,
     pub spki_pin: Option<String>,
+    pub server_capabilities: Vec<String>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -72,6 +73,8 @@ struct StoredProfile {
     pairing_secret: Option<[u8; 32]>,
     account_master_public: Vec<u8>,
     spki_pin: Option<String>,
+    #[serde(default)]
+    server_capabilities: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -275,6 +278,7 @@ impl LocalStore {
         if let Some(parent) = path.parent() {
             tokio::fs::create_dir_all(parent).await?;
         }
+        harden_parent_permissions(path).await?;
         let options = SqliteConnectOptions::new()
             .filename(path)
             .create_if_missing(true)
@@ -286,10 +290,25 @@ impl LocalStore {
             .connect_with(options)
             .await?;
         sqlx::migrate!().run(&pool).await?;
-        Ok(Self {
+        let store = Self {
             pool,
             path: path.to_path_buf(),
-        })
+        };
+        store.harden_file_permissions().await?;
+        Ok(store)
+    }
+
+    async fn harden_file_permissions(&self) -> Result<()> {
+        for path in [
+            self.path.clone(),
+            PathBuf::from(format!("{}-wal", self.path.display())),
+            PathBuf::from(format!("{}-shm", self.path.display())),
+        ] {
+            if tokio::fs::try_exists(&path).await.unwrap_or(false) {
+                harden_private_file(&path).await?;
+            }
+        }
+        Ok(())
     }
 
     pub async fn unlock(&self, passphrase: &str) -> Result<VaultSession> {
@@ -367,6 +386,7 @@ impl LocalStore {
         sqlx::query(&format!("VACUUM INTO '{escaped}'"))
             .execute(&self.pool)
             .await?;
+        harden_private_file(&backup).await?;
         Ok(())
     }
 
@@ -434,6 +454,7 @@ impl LocalStore {
             pairing_secret: plain.pairing_secret,
             account_master_public: plain.account_master_public,
             spki_pin: plain.spki_pin,
+            server_capabilities: plain.server_capabilities,
         }))
     }
 
@@ -1143,6 +1164,37 @@ impl LocalStore {
     }
 }
 
+#[cfg(unix)]
+async fn harden_parent_permissions(path: &Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        tokio::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700)).await?;
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+async fn harden_parent_permissions(_path: &Path) -> Result<()> {
+    Ok(())
+}
+
+#[cfg(unix)]
+async fn harden_private_file(path: &Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    tokio::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).await?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+async fn harden_private_file(_path: &Path) -> Result<()> {
+    Ok(())
+}
+
 async fn delete_conversation_state(
     tx: &mut Transaction<'_, Sqlite>,
     peer_account_id: &str,
@@ -1266,6 +1318,7 @@ fn encode_profile(vault: &VaultSession, profile: &RuntimeProfile) -> Result<Vec<
         pairing_secret: profile.pairing_secret,
         account_master_public: profile.account_master_public.clone(),
         spki_pin: profile.spki_pin.clone(),
+        server_capabilities: profile.server_capabilities.clone(),
     };
     let mut encoded = b"TCP3".to_vec();
     encoded.extend(postcard::to_allocvec(&plain)?);
@@ -1519,6 +1572,7 @@ mod tests {
             pending: false,
             pairing_secret: None,
             spki_pin: None,
+            server_capabilities: Vec::new(),
         };
         let peer = bundle("account-a", "alice");
         store.upsert_contact(&peer).await?;
@@ -1680,6 +1734,7 @@ mod tests {
             pending: false,
             pairing_secret: None,
             spki_pin: None,
+            server_capabilities: Vec::new(),
         };
         let peer = bundle("account-a", "alice");
         store.upsert_contact(&peer).await?;
@@ -1770,6 +1825,7 @@ mod tests {
             pairing_secret: None,
             account_master_public,
             spki_pin: None,
+            server_capabilities: Vec::new(),
         };
         store.save_profile(&vault, &profile).await?;
         let canonical: Vec<u8> =
@@ -1893,6 +1949,27 @@ mod tests {
             .filter_map(std::result::Result::ok)
             .any(|entry| entry.file_name().to_string_lossy().contains(".pre-v2-"));
         assert!(backup_exists);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn local_database_uses_private_unix_permissions() -> Result<()> {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let directory = tempfile::tempdir()?;
+        let data_dir = directory.path().join("account-data");
+        let database = data_dir.join("client.db");
+        let _store = LocalStore::open(&database).await?;
+
+        assert_eq!(
+            std::fs::metadata(&data_dir)?.permissions().mode() & 0o777,
+            0o700
+        );
+        assert_eq!(
+            std::fs::metadata(&database)?.permissions().mode() & 0o777,
+            0o600
+        );
         Ok(())
     }
 }

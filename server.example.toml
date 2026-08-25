@@ -4,6 +4,8 @@ admin_socket_path = "data/admin.sock"
 public_domain = "chat.example.com"
 log_filter = "tui_chat_server=info"
 trusted_proxy_tls = false
+trusted_proxy_cidrs = ["127.0.0.1/32", "::1/128"]
+reject_websocket_origins = true
 
 # 公网部署时由私有 Docker 网络中的 Caddy 传递 TLS 和客户端 IP。
 # 只有同时将 bind 改为非回环地址时才设置为 true。
@@ -12,8 +14,15 @@ max_connections_per_ip = 32
 max_unauthenticated_per_ip = 4
 auth_attempts_per_minute = 10
 auth_attempt_burst = 5
+auth_attempts_per_account_per_hour = 30
 auth_hash_concurrency = 4
 requests_per_minute = 120
 request_burst = 30
 audit_retention_days = 90
 pairing_ttl_seconds = 86400
+
+# 已投递的端到端密文保留 90 天；未投递密文会继续保留，直到投递、设备撤销或管理员清理。
+delivered_retention_days = 90
+max_account_ciphertext_bytes = 536870912
+max_total_ciphertext_bytes = 10737418240
+min_free_disk_bytes = 1073741824

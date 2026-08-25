@@ -28,6 +28,9 @@ message Frame {
     PairingEvent pairing_event = 41;
     ActivateDevice activate_device = 42;
     AckPairingEvent ack_pairing_event = 43;
+    ListOwnDevices list_own_devices = 50;
+    OwnDeviceList own_device_list = 51;
+    RevokeOwnDevice revoke_own_device = 52;
     Error error = 90;
     Ping ping = 91;
     Pong pong = 92;
@@ -38,6 +41,7 @@ message Frame {
 message ClientHello {
   string username = 1;
   string device_id = 2;
+  repeated string capabilities = 3;
 }
 
 message AuthChallenge {
@@ -66,6 +70,7 @@ message Authenticated {
   bytes account_master_key = 6;
   uint64 roster_revision = 7;
   BootstrapMode bootstrap_mode = 8;
+  repeated string capabilities = 9;
 }
 
 enum BootstrapMode {
@@ -182,6 +187,22 @@ message ActivateDevice {
   uint64 roster_revision = 3;
   bytes roster_signature = 4;
 }
+
+message ListOwnDevices {}
+
+message OwnDeviceInfo {
+  string device_id = 1;
+  string device_name = 2;
+  bool pending = 3;
+  bool revoked = 4;
+  bool current = 5;
+  bool online = 6;
+  int64 created_at_ms = 7;
+  int64 last_authenticated_at_ms = 8;
+}
+
+message OwnDeviceList { repeated OwnDeviceInfo devices = 1; }
+message RevokeOwnDevice { string device_id = 1; }
 
 message Error { string code = 1; string message = 2; bool retryable = 3; }
 message Ping { int64 sent_at_ms = 1; }

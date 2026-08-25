@@ -10,7 +10,7 @@ mod ws;
 use std::{path::PathBuf, sync::Arc};
 
 use anyhow::Result;
-use axum::{Router, routing::get};
+use axum::{Router, extract::State, http::StatusCode, routing::get};
 use clap::{Parser, Subcommand};
 use config::Config;
 use db::Db;
@@ -56,6 +56,10 @@ enum Command {
     Audit {
         #[command(subcommand)]
         command: AuditCommand,
+    },
+    Storage {
+        #[command(subcommand)]
+        command: StorageCommand,
     },
     Admin,
 }
@@ -141,6 +145,15 @@ enum AuditCommand {
     List {
         #[arg(long, default_value_t = 100)]
         limit: u32,
+    },
+}
+
+#[derive(Subcommand)]
+enum StorageCommand {
+    Status,
+    Cleanup {
+        #[arg(long)]
+        yes: bool,
     },
 }
 
@@ -245,6 +258,14 @@ async fn main() -> Result<()> {
         Command::Audit {
             command: AuditCommand::List { limit },
         } => admin::list_audit(&db, limit, output).await,
+        Command::Storage { command } => match command {
+            StorageCommand::Status => {
+                admin::storage_status(&db, config.storage_limits(), output).await
+            }
+            StorageCommand::Cleanup { yes } => {
+                admin::cleanup_storage(&db, config.delivered_retention_days, yes).await
+            }
+        },
         Command::Admin => admin_ui::run(&config.admin_socket_path).await,
     }
 }
@@ -257,12 +278,12 @@ async fn healthcheck(port: u16) -> Result<()> {
     )
     .await??;
     stream
-        .write_all(b"GET /healthz HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+        .write_all(b"GET /readyz HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
         .await?;
     let mut response = [0_u8; 64];
     let read = stream.read(&mut response).await?;
     if !response[..read].starts_with(b"HTTP/1.1 200") {
-        anyhow::bail!("health endpoint did not return HTTP 200");
+        anyhow::bail!("readiness endpoint did not return HTTP 200");
     }
     Ok(())
 }
@@ -272,6 +293,7 @@ async fn serve(config: Config, db: Db) -> Result<()> {
     let state = Arc::new(ws::AppState::new(db, config.clone())?);
     let app = Router::new()
         .route("/healthz", get(|| async { "ok\n" }))
+        .route("/readyz", get(readiness))
         .route("/v2/ws", get(ws::upgrade))
         .route(
             "/v1/ws",
@@ -312,6 +334,14 @@ async fn serve(config: Config, db: Db) -> Result<()> {
         let _ = tokio::fs::remove_file(&admin_socket).await;
     }
     result.map_err(Into::into)
+}
+
+async fn readiness(State(state): State<Arc<ws::AppState>>) -> StatusCode {
+    if state.ready().await {
+        StatusCode::OK
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    }
 }
 
 async fn shutdown() {

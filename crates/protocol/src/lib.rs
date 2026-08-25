@@ -11,6 +11,15 @@ pub mod v1 {
 pub const PROTOCOL_VERSION: u32 = 2;
 pub const MAX_FRAME_BYTES: usize = 256 * 1024;
 pub const MAX_TEXT_BYTES: usize = 16 * 1024;
+pub const CAPABILITY_OWN_DEVICES: &str = "own_devices_v1";
+pub const CAPABILITY_STABLE_ERRORS: &str = "stable_errors_v1";
+
+pub fn client_capabilities() -> Vec<String> {
+    vec![
+        CAPABILITY_OWN_DEVICES.to_owned(),
+        CAPABILITY_STABLE_ERRORS.to_owned(),
+    ]
+}
 
 pub fn conversation_id(account_a: &str, account_b: &str) -> String {
     use sha2::{Digest, Sha256};
@@ -140,5 +149,39 @@ mod tests {
             decode_frame(&vec![0; MAX_FRAME_BYTES + 1]),
             Err(CodecError::TooLarge)
         ));
+    }
+
+    #[test]
+    fn device_management_frames_and_capabilities_round_trip() {
+        let capabilities = client_capabilities();
+        assert!(
+            capabilities
+                .iter()
+                .any(|item| item == CAPABILITY_OWN_DEVICES)
+        );
+        assert!(
+            capabilities
+                .iter()
+                .any(|item| item == CAPABILITY_STABLE_ERRORS)
+        );
+        let original = frame(
+            "devices",
+            v1::frame::Body::OwnDeviceList(v1::OwnDeviceList {
+                devices: vec![v1::OwnDeviceInfo {
+                    device_id: "device".into(),
+                    device_name: "laptop".into(),
+                    pending: false,
+                    revoked: false,
+                    current: true,
+                    online: true,
+                    created_at_ms: 1,
+                    last_authenticated_at_ms: 2,
+                }],
+            }),
+        );
+        assert_eq!(
+            decode_frame(&encode_frame(&original)).expect("valid device frame"),
+            original
+        );
     }
 }

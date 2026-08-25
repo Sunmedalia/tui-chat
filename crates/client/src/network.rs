@@ -90,6 +90,7 @@ impl RawConnection {
         let pending: Arc<Mutex<HashMap<String, oneshot::Sender<v1::Frame>>>> =
             Arc::new(Mutex::new(HashMap::new()));
         let reader_pending = pending.clone();
+        let writer_event_tx = event_tx.clone();
         tokio::spawn(async move {
             while let Some(frame) = out_rx.recv().await {
                 if sink
@@ -97,6 +98,7 @@ impl RawConnection {
                     .await
                     .is_err()
                 {
+                    let _ = writer_event_tx.try_send(connection_closed_frame());
                     break;
                 }
             }
@@ -120,16 +122,8 @@ impl RawConnection {
                     break;
                 }
             }
-            let _ = event_tx
-                .send(frame(
-                    "",
-                    Body::Error(v1::Error {
-                        code: "connection_closed".into(),
-                        message: "connection closed".into(),
-                        retryable: true,
-                    }),
-                ))
-                .await;
+            reader_pending.lock().await.clear();
+            let _ = event_tx.send(connection_closed_frame()).await;
         });
         (
             RpcClient {
@@ -139,6 +133,17 @@ impl RawConnection {
             event_rx,
         )
     }
+}
+
+fn connection_closed_frame() -> v1::Frame {
+    frame(
+        "",
+        Body::Error(v1::Error {
+            code: "connection_closed".into(),
+            message: "connection closed".into(),
+            retryable: true,
+        }),
+    )
 }
 
 fn validate_server_url(value: &str) -> Result<Url> {
@@ -165,6 +170,13 @@ fn validate_server_url(value: &str) -> Result<Url> {
 }
 
 impl RpcClient {
+    pub fn try_send_frame(&self, frame: v1::Frame) -> Result<()> {
+        self.tx.try_send(frame).map_err(|error| match error {
+            mpsc::error::TrySendError::Full(_) => anyhow!("connection send queue is full"),
+            mpsc::error::TrySendError::Closed(_) => anyhow!("connection writer stopped"),
+        })
+    }
+
     pub async fn request(&self, body: Body) -> Result<v1::Frame> {
         let id = Uuid::new_v4().to_string();
         self.request_with_id(id, body).await

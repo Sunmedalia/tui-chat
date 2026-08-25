@@ -14,7 +14,7 @@ use local::{LocalStore, RuntimeProfile, VaultSession};
 use network::RawConnection;
 use tui_chat_crypto::{DeviceIdentity, OlmMachine, PairingState};
 use tui_chat_protocol::{
-    auth_challenge_payload,
+    auth_challenge_payload, client_capabilities,
     v1::{self, BootstrapDevice, DeviceAuth, PasswordAuth, frame::Body},
 };
 use url::Url;
@@ -106,6 +106,7 @@ async fn authenticate(
         .request(Body::ClientHello(v1::ClientHello {
             username: username.to_owned(),
             device_id: device_id.clone(),
+            capabilities: client_capabilities(),
         }))
         .await?;
     let Some(Body::AuthChallenge(challenge)) = response.body else {
@@ -144,6 +145,7 @@ async fn authenticate(
             if !auth.pending_device || auth.account_id != profile.account_id {
                 bail!("pending device state does not match the server");
             }
+            profile.server_capabilities = auth.capabilities;
             return Ok((raw, profile, true));
         }
         let payload = auth_challenge_payload(
@@ -179,6 +181,7 @@ async fn authenticate(
         if authenticated.password_change_required {
             change_password(&mut raw).await?;
         }
+        profile.server_capabilities = authenticated.capabilities.clone();
         let missing = 50_usize.saturating_sub(profile.machine.stored_prekey_count());
         if missing > 0 {
             profile.machine.generate_prekeys(missing);
@@ -257,6 +260,7 @@ async fn authenticate(
         pairing_secret,
         account_master_public: authenticated.account_master_key.clone(),
         spki_pin,
+        server_capabilities: authenticated.capabilities,
     };
     store.save_profile(vault, &profile).await?;
     if authenticated.password_change_required {

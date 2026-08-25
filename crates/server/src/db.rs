@@ -1,18 +1,58 @@
-use std::{collections::BTreeSet, path::Path, time::Duration};
+use std::{
+    collections::BTreeSet,
+    path::{Path, PathBuf},
+    time::Duration,
+};
 
 use anyhow::{Result, bail};
+use serde::Serialize;
 use sqlx::{
     Row, SqlitePool,
     sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous},
 };
 use tui_chat_protocol::v1::{
-    DeliveryUpdate, DeviceBundle, EncryptedEnvelope, OneTimeKey, StoredDeliveryUpdate,
-    StoredEnvelope,
+    DeliveryUpdate, DeviceBundle, EncryptedEnvelope, OneTimeKey, OwnDeviceInfo,
+    StoredDeliveryUpdate, StoredEnvelope,
 };
 
 #[derive(Clone)]
 pub struct Db {
     pool: SqlitePool,
+    path: PathBuf,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct StorageLimits {
+    pub max_account_ciphertext_bytes: u64,
+    pub max_total_ciphertext_bytes: u64,
+    pub min_free_disk_bytes: u64,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct StorageStatus {
+    pub ciphertext_bytes: u64,
+    pub account_limit_bytes: u64,
+    pub total_limit_bytes: u64,
+    pub free_disk_bytes: u64,
+    pub minimum_free_disk_bytes: u64,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, PartialEq, Eq)]
+pub struct CleanupStats {
+    pub envelopes: u64,
+    pub ciphertext_bytes: u64,
+    pub logical_messages: u64,
+    pub delivery_updates: u64,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum StorageRejection {
+    #[error("account ciphertext quota exceeded")]
+    AccountQuota,
+    #[error("server ciphertext quota exceeded")]
+    TotalQuota,
+    #[error("server disk free-space reserve reached")]
+    DiskPressure,
 }
 
 #[derive(Debug, Clone)]
@@ -47,6 +87,7 @@ impl Db {
         if let Some(parent) = path.parent() {
             tokio::fs::create_dir_all(parent).await?;
         }
+        harden_parent_permissions(path).await?;
         let options = SqliteConnectOptions::new()
             .filename(path)
             .create_if_missing(true)
@@ -59,11 +100,49 @@ impl Db {
             .connect_with(options)
             .await?;
         sqlx::migrate!().run(&pool).await?;
-        Ok(Self { pool })
+        let db = Self {
+            pool,
+            path: path.to_path_buf(),
+        };
+        db.harden_file_permissions().await?;
+        Ok(db)
     }
 
     pub fn pool(&self) -> &SqlitePool {
         &self.pool
+    }
+
+    #[cfg(unix)]
+    async fn harden_file_permissions(&self) -> Result<()> {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        if let Some(parent) = self
+            .path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+        {
+            tokio::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700)).await?;
+        }
+        for path in [
+            self.path.clone(),
+            PathBuf::from(format!("{}-wal", self.path.display())),
+            PathBuf::from(format!("{}-shm", self.path.display())),
+        ] {
+            if tokio::fs::try_exists(&path).await.unwrap_or(false) {
+                tokio::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).await?;
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(not(unix))]
+    async fn harden_file_permissions(&self) -> Result<()> {
+        Ok(())
+    }
+
+    fn free_disk_bytes(&self) -> Result<u64> {
+        let directory = self.path.parent().unwrap_or_else(|| Path::new("."));
+        fs4::available_space(directory).map_err(Into::into)
     }
 
     pub async fn account_by_username(&self, username: &str) -> Result<Option<Account>> {
@@ -125,6 +204,47 @@ impl Db {
         Ok(rows.into_iter().map(device_bundle_from_row).collect())
     }
 
+    pub async fn own_devices(&self, account_id: &str) -> Result<Vec<OwnDeviceInfo>> {
+        let rows = sqlx::query(
+            "SELECT id, name, pending, revoked, created_at_ms,
+                    COALESCE(last_authenticated_at_ms, 0) AS last_authenticated_at_ms
+             FROM devices WHERE account_id = ?
+             ORDER BY revoked, pending, created_at_ms",
+        )
+        .bind(account_id)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|row| OwnDeviceInfo {
+                device_id: row.get("id"),
+                device_name: row.get("name"),
+                pending: row.get::<i64, _>("pending") != 0,
+                revoked: row.get::<i64, _>("revoked") != 0,
+                current: false,
+                online: false,
+                created_at_ms: row.get("created_at_ms"),
+                last_authenticated_at_ms: row.get("last_authenticated_at_ms"),
+            })
+            .collect())
+    }
+
+    pub async fn revoke_own_device(&self, account_id: &str, device_id: &str) -> Result<bool> {
+        let affected = sqlx::query(
+            "UPDATE devices SET revoked = 1
+             WHERE account_id = ? AND id = ? AND revoked = 0",
+        )
+        .bind(account_id)
+        .bind(device_id)
+        .execute(&self.pool)
+        .await?
+        .rows_affected();
+        if affected == 1 {
+            self.cleanup_revoked_device(device_id).await?;
+        }
+        Ok(affected == 1)
+    }
+
     pub async fn insert_device(
         &self,
         account_id: &str,
@@ -165,6 +285,15 @@ impl Db {
         .bind(account_id)
         .execute(&self.pool)
         .await?;
+        Ok(())
+    }
+
+    pub async fn record_device_authentication(&self, device_id: &str, now: i64) -> Result<()> {
+        sqlx::query("UPDATE devices SET last_authenticated_at_ms = ? WHERE id = ?")
+            .bind(now)
+            .bind(device_id)
+            .execute(&self.pool)
+            .await?;
         Ok(())
     }
 
@@ -238,6 +367,7 @@ impl Db {
         sender_device: &str,
         envelopes: &[EncryptedEnvelope],
         now: i64,
+        limits: StorageLimits,
     ) -> Result<Vec<(String, u64)>> {
         if envelopes.is_empty() || envelopes.len() > 16 {
             bail!("envelope batch must contain 1..=16 entries");
@@ -264,6 +394,10 @@ impl Db {
             bail!("invalid conversation or ciphertext");
         }
 
+        if self.free_disk_bytes()? < limits.min_free_disk_bytes {
+            return Err(StorageRejection::DiskPressure.into());
+        }
+
         let mut tx = self.pool.begin().await?;
         sqlx::query("INSERT OR IGNORE INTO logical_messages(logical_message_id, sender_account_id, sender_device_id, peer_account_id, conversation_id, client_sent_at_ms, accepted_at_ms) VALUES(?, ?, ?, ?, ?, ?, ?)")
             .bind(logical).bind(sender_account).bind(sender_device).bind(peer)
@@ -285,14 +419,66 @@ impl Db {
             bail!("logical message id conflicts with immutable metadata");
         }
 
-        let mut stored = Vec::with_capacity(envelopes.len());
+        let mut active_envelopes = Vec::with_capacity(envelopes.len());
         for envelope in envelopes {
             let active: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM devices d JOIN accounts a ON a.id = d.account_id WHERE d.account_id = ? AND d.id = ? AND d.pending = 0 AND d.revoked = 0 AND a.state = 'active'")
                 .bind(&envelope.recipient_account_id).bind(&envelope.recipient_device_id)
                 .fetch_one(&mut *tx).await?;
-            if active != 1 {
-                bail!("recipient device is unavailable");
+            if active == 1 {
+                active_envelopes.push(envelope);
             }
+        }
+        if active_envelopes.is_empty()
+            || (peer != sender_account
+                && !active_envelopes
+                    .iter()
+                    .any(|envelope| envelope.recipient_account_id == peer))
+        {
+            bail!("recipient device is unavailable");
+        }
+
+        let mut additional_bytes = 0_u64;
+        for envelope in &active_envelopes {
+            let existing: Option<Vec<u8>> =
+                sqlx::query_scalar("SELECT ciphertext FROM envelopes WHERE envelope_id = ?")
+                    .bind(&envelope.envelope_id)
+                    .fetch_optional(&mut *tx)
+                    .await?;
+            match existing {
+                Some(ciphertext) if ciphertext == envelope.ciphertext => {}
+                Some(_) => bail!("envelope id conflicts with immutable metadata"),
+                None => {
+                    additional_bytes = additional_bytes
+                        .checked_add(envelope.ciphertext.len() as u64)
+                        .ok_or_else(|| anyhow::anyhow!("ciphertext size overflow"))?;
+                }
+            }
+        }
+        let account_bytes: i64 = sqlx::query_scalar(
+            "SELECT COALESCE(ciphertext_bytes, 0) FROM account_storage_usage WHERE account_id = ?",
+        )
+        .bind(sender_account)
+        .fetch_optional(&mut *tx)
+        .await?
+        .unwrap_or(0);
+        let total_bytes: i64 = sqlx::query_scalar(
+            "SELECT COALESCE(SUM(ciphertext_bytes), 0) FROM account_storage_usage",
+        )
+        .fetch_one(&mut *tx)
+        .await?;
+        if (account_bytes.max(0) as u64).saturating_add(additional_bytes)
+            > limits.max_account_ciphertext_bytes
+        {
+            return Err(StorageRejection::AccountQuota.into());
+        }
+        if (total_bytes.max(0) as u64).saturating_add(additional_bytes)
+            > limits.max_total_ciphertext_bytes
+        {
+            return Err(StorageRejection::TotalQuota.into());
+        }
+
+        let mut stored = Vec::with_capacity(active_envelopes.len());
+        for envelope in active_envelopes {
             sqlx::query("INSERT OR IGNORE INTO envelopes(envelope_id, logical_message_id, sender_account_id, sender_device_id, recipient_account_id, recipient_device_id, conversation_id, ciphertext, olm_message_type, client_sent_at_ms, accepted_at_ms) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
                 .bind(&envelope.envelope_id).bind(&envelope.logical_message_id)
                 .bind(sender_account).bind(sender_device).bind(&envelope.recipient_account_id)
@@ -326,6 +512,120 @@ impl Db {
         }
         tx.commit().await?;
         Ok(stored)
+    }
+
+    pub async fn storage_status(&self, limits: StorageLimits) -> Result<StorageStatus> {
+        let ciphertext_bytes: i64 = sqlx::query_scalar(
+            "SELECT COALESCE(SUM(ciphertext_bytes), 0) FROM account_storage_usage",
+        )
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(StorageStatus {
+            ciphertext_bytes: ciphertext_bytes.max(0) as u64,
+            account_limit_bytes: limits.max_account_ciphertext_bytes,
+            total_limit_bytes: limits.max_total_ciphertext_bytes,
+            free_disk_bytes: self.free_disk_bytes()?,
+            minimum_free_disk_bytes: limits.min_free_disk_bytes,
+        })
+    }
+
+    pub async fn cleanup_delivered_envelopes(
+        &self,
+        delivered_before_ms: i64,
+        limit: u32,
+    ) -> Result<CleanupStats> {
+        let limit = i64::from(limit.clamp(1, 10_000));
+        let mut tx = self.pool.begin().await?;
+        let removed = sqlx::query(
+            "DELETE FROM envelopes WHERE cursor IN (
+                SELECT cursor FROM envelopes
+                WHERE delivered_at_ms IS NOT NULL AND delivered_at_ms < ?
+                ORDER BY cursor LIMIT ?
+             ) RETURNING length(ciphertext) AS ciphertext_bytes",
+        )
+        .bind(delivered_before_ms)
+        .bind(limit)
+        .fetch_all(&mut *tx)
+        .await?;
+        let envelopes = removed.len() as u64;
+        let ciphertext_bytes = removed
+            .iter()
+            .map(|row| row.get::<i64, _>("ciphertext_bytes").max(0) as u64)
+            .sum();
+        let delivery_updates = sqlx::query(
+            "DELETE FROM delivery_updates
+             WHERE NOT EXISTS (
+                SELECT 1 FROM envelopes e
+                WHERE e.logical_message_id = delivery_updates.logical_message_id
+             )",
+        )
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+        let logical_messages = sqlx::query(
+            "DELETE FROM logical_messages
+             WHERE NOT EXISTS (
+                SELECT 1 FROM envelopes e
+                WHERE e.logical_message_id = logical_messages.logical_message_id
+             )",
+        )
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+        tx.commit().await?;
+        Ok(CleanupStats {
+            envelopes,
+            ciphertext_bytes,
+            logical_messages,
+            delivery_updates,
+        })
+    }
+
+    pub async fn cleanup_revoked_device(&self, device_id: &str) -> Result<CleanupStats> {
+        let mut tx = self.pool.begin().await?;
+        sqlx::query("DELETE FROM prekeys WHERE device_id = ?")
+            .bind(device_id)
+            .execute(&mut *tx)
+            .await?;
+        let removed = sqlx::query(
+            "DELETE FROM envelopes WHERE recipient_device_id = ?
+             RETURNING length(ciphertext) AS ciphertext_bytes",
+        )
+        .bind(device_id)
+        .fetch_all(&mut *tx)
+        .await?;
+        let envelopes = removed.len() as u64;
+        let ciphertext_bytes = removed
+            .iter()
+            .map(|row| row.get::<i64, _>("ciphertext_bytes").max(0) as u64)
+            .sum();
+        let delivery_updates = sqlx::query(
+            "DELETE FROM delivery_updates
+             WHERE NOT EXISTS (
+                SELECT 1 FROM envelopes e
+                WHERE e.logical_message_id = delivery_updates.logical_message_id
+             )",
+        )
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+        let logical_messages = sqlx::query(
+            "DELETE FROM logical_messages
+             WHERE NOT EXISTS (
+                SELECT 1 FROM envelopes e
+                WHERE e.logical_message_id = logical_messages.logical_message_id
+             )",
+        )
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+        tx.commit().await?;
+        Ok(CleanupStats {
+            envelopes,
+            ciphertext_bytes,
+            logical_messages,
+            delivery_updates,
+        })
     }
 
     pub async fn stored_envelope(&self, envelope_id: &str) -> Result<Option<StoredEnvelope>> {
@@ -514,6 +814,24 @@ impl Db {
     }
 }
 
+#[cfg(unix)]
+async fn harden_parent_permissions(path: &Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        tokio::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700)).await?;
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+async fn harden_parent_permissions(_path: &Path) -> Result<()> {
+    Ok(())
+}
+
 fn account_from_row(row: sqlx::sqlite::SqliteRow) -> Account {
     Account {
         id: row.get("id"),
@@ -561,11 +879,18 @@ fn stored_envelope_from_row(row: sqlx::sqlite::SqliteRow) -> StoredEnvelope {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tempfile::tempdir;
+    use tempfile::{TempDir, tempdir};
     use tui_chat_protocol::v1::EncryptedEnvelope;
 
-    #[tokio::test]
-    async fn envelopes_are_durable_idempotent_and_acknowledged() -> Result<()> {
+    fn unlimited_storage() -> StorageLimits {
+        StorageLimits {
+            max_account_ciphertext_bytes: u64::MAX,
+            max_total_ciphertext_bytes: u64::MAX,
+            min_free_disk_bytes: 0,
+        }
+    }
+
+    async fn populated_db() -> Result<(TempDir, Db, i64)> {
         let directory = tempdir()?;
         let db = Db::connect(&directory.path().join("server.db")).await?;
         let now = 1_700_000_000_000_i64;
@@ -577,21 +902,32 @@ mod tests {
             sqlx::query("INSERT INTO devices(id, account_id, name, auth_signing_key, olm_ed25519_key, olm_curve25519_key, certificate_signature, created_at_ms) VALUES(?, ?, 'test', ?, ?, ?, ?, ?)")
                 .bind(id).bind(account).bind(vec![2_u8; 32]).bind(vec![3_u8; 32]).bind(vec![4_u8; 32]).bind(vec![5_u8; 64]).bind(now).execute(db.pool()).await?;
         }
-        let envelope = EncryptedEnvelope {
-            envelope_id: "envelope-1".into(),
-            logical_message_id: "message-1".into(),
+        Ok((directory, db, now))
+    }
+
+    fn envelope(id: &str, logical_id: &str, ciphertext: Vec<u8>, now: i64) -> EncryptedEnvelope {
+        EncryptedEnvelope {
+            envelope_id: id.to_owned(),
+            logical_message_id: logical_id.to_owned(),
             conversation_id: tui_chat_protocol::conversation_id("account-a", "account-b"),
             recipient_account_id: "account-b".into(),
             recipient_device_id: "device-b".into(),
-            ciphertext: vec![9, 8, 7],
+            ciphertext,
             olm_message_type: 0,
             client_sent_at_ms: now,
-        };
+        }
+    }
+
+    #[tokio::test]
+    async fn envelopes_are_durable_idempotent_and_acknowledged() -> Result<()> {
+        let (_directory, db, now) = populated_db().await?;
+        let envelope = envelope("envelope-1", "message-1", vec![9, 8, 7], now);
         db.store_envelopes(
             "account-a",
             "device-a",
             std::slice::from_ref(&envelope),
             now,
+            unlimited_storage(),
         )
         .await?;
         db.store_envelopes(
@@ -599,6 +935,7 @@ mod tests {
             "device-a",
             std::slice::from_ref(&envelope),
             now + 1,
+            unlimited_storage(),
         )
         .await?;
         let mut conflicting = envelope.clone();
@@ -609,6 +946,7 @@ mod tests {
                 "device-a",
                 std::slice::from_ref(&conflicting),
                 now + 2,
+                unlimited_storage(),
             )
             .await
             .is_err()
@@ -625,6 +963,154 @@ mod tests {
                 .as_ref()
                 .map(|update| update.logical_message_id.as_str()),
             Some("message-1")
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn ciphertext_quota_is_transactional_and_idempotent() -> Result<()> {
+        let (_directory, db, now) = populated_db().await?;
+        let limits = StorageLimits {
+            max_account_ciphertext_bytes: 3,
+            max_total_ciphertext_bytes: 100,
+            min_free_disk_bytes: 0,
+        };
+        let first = envelope("envelope-1", "message-1", vec![1, 2, 3], now);
+        db.store_envelopes(
+            "account-a",
+            "device-a",
+            std::slice::from_ref(&first),
+            now,
+            limits,
+        )
+        .await?;
+        db.store_envelopes(
+            "account-a",
+            "device-a",
+            std::slice::from_ref(&first),
+            now + 1,
+            limits,
+        )
+        .await?;
+
+        let second = envelope("envelope-2", "message-2", vec![4], now + 2);
+        let error = db
+            .store_envelopes(
+                "account-a",
+                "device-a",
+                std::slice::from_ref(&second),
+                now + 2,
+                limits,
+            )
+            .await
+            .expect_err("the account quota must reject additional ciphertext");
+        assert!(matches!(
+            error.downcast_ref::<StorageRejection>(),
+            Some(StorageRejection::AccountQuota)
+        ));
+        assert_eq!(db.storage_status(limits).await?.ciphertext_bytes, 3);
+        assert!(db.stored_envelope("envelope-2").await?.is_none());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cleanup_removes_only_expired_delivered_ciphertext() -> Result<()> {
+        let (_directory, db, now) = populated_db().await?;
+        let delivered = envelope("envelope-1", "message-1", vec![1, 2, 3], now);
+        let pending = envelope("envelope-2", "message-2", vec![4, 5], now + 1);
+        for item in [&delivered, &pending] {
+            db.store_envelopes(
+                "account-a",
+                "device-a",
+                std::slice::from_ref(item),
+                now,
+                unlimited_storage(),
+            )
+            .await?;
+        }
+        db.ack("device-b", "envelope-1", now + 2).await?;
+
+        let stats = db.cleanup_delivered_envelopes(now + 3, 100).await?;
+        assert_eq!(stats.envelopes, 1);
+        assert_eq!(stats.ciphertext_bytes, 3);
+        assert!(db.stored_envelope("envelope-1").await?.is_none());
+        assert!(db.stored_envelope("envelope-2").await?.is_some());
+        assert_eq!(
+            db.storage_status(unlimited_storage())
+                .await?
+                .ciphertext_bytes,
+            2
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn self_service_revoke_is_account_scoped_and_cleans_queued_data() -> Result<()> {
+        let (_directory, db, now) = populated_db().await?;
+        let queued = envelope("envelope-1", "message-1", vec![1, 2, 3], now);
+        db.store_envelopes(
+            "account-a",
+            "device-a",
+            std::slice::from_ref(&queued),
+            now,
+            unlimited_storage(),
+        )
+        .await?;
+
+        assert!(!db.revoke_own_device("account-a", "device-b").await?);
+        assert!(db.revoke_own_device("account-b", "device-b").await?);
+        assert!(db.stored_envelope("envelope-1").await?.is_none());
+        let devices = db.own_devices("account-b").await?;
+        assert_eq!(devices.len(), 1);
+        assert!(devices[0].revoked);
+        assert_eq!(
+            db.storage_status(unlimited_storage())
+                .await?
+                .ciphertext_bytes,
+            0
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn revoked_device_copies_do_not_block_an_active_peer() -> Result<()> {
+        let (_directory, db, now) = populated_db().await?;
+        sqlx::query("INSERT INTO devices(id, account_id, name, auth_signing_key, olm_ed25519_key, olm_curve25519_key, certificate_signature, revoked, created_at_ms) VALUES('device-old', 'account-a', 'old', ?, ?, ?, ?, 1, ?)")
+            .bind(vec![2_u8; 32]).bind(vec![3_u8; 32]).bind(vec![4_u8; 32])
+            .bind(vec![5_u8; 64]).bind(now).execute(db.pool()).await?;
+        let peer = envelope("envelope-peer", "message-1", vec![1, 2, 3], now);
+        let mut stale_self_copy = envelope("envelope-old", "message-1", vec![4, 5], now);
+        stale_self_copy.recipient_account_id = "account-a".into();
+        stale_self_copy.recipient_device_id = "device-old".into();
+
+        let stored = db
+            .store_envelopes(
+                "account-a",
+                "device-a",
+                &[peer, stale_self_copy],
+                now,
+                unlimited_storage(),
+            )
+            .await?;
+        assert_eq!(stored.len(), 1);
+        assert_eq!(stored[0].0, "device-b");
+        assert!(db.stored_envelope("envelope-old").await?.is_none());
+
+        assert!(db.revoke_own_device("account-b", "device-b").await?);
+        let mut self_only = envelope("envelope-self", "message-2", vec![9], now + 1);
+        self_only.recipient_account_id = "account-a".into();
+        self_only.recipient_device_id = "device-a".into();
+        let stale_peer = envelope("envelope-stale-peer", "message-2", vec![8], now + 1);
+        assert!(
+            db.store_envelopes(
+                "account-a",
+                "device-a",
+                &[self_only, stale_peer],
+                now + 1,
+                unlimited_storage(),
+            )
+            .await
+            .is_err()
         );
         Ok(())
     }

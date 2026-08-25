@@ -6,7 +6,7 @@ use std::{
 };
 
 use anyhow::{Result, anyhow, bail};
-use argon2::{Argon2, PasswordHash, PasswordVerifier};
+use argon2::{PasswordHash, PasswordVerifier};
 use axum::{
     extract::{
         ConnectInfo, State, WebSocketUpgrade,
@@ -22,8 +22,8 @@ use serde::Serialize;
 use tokio::sync::{Mutex, RwLock, Semaphore, mpsc, watch};
 use tracing::debug;
 use tui_chat_protocol::{
-    PROTOCOL_VERSION, auth_challenge_payload, decode_frame, device_certificate_payload,
-    encode_frame, frame,
+    CAPABILITY_OWN_DEVICES, CAPABILITY_STABLE_ERRORS, PROTOCOL_VERSION, auth_challenge_payload,
+    decode_frame, device_certificate_payload, encode_frame, frame,
     v1::{
         self, AuthChallenge, Authenticated, DeliveryUpdate, DeviceBundle, Error as ErrorFrame,
         PairingEvent, PairingRequest, PreKeyBundle, SendAccepted, SyncBatch, UserBundle,
@@ -34,7 +34,10 @@ use uuid::Uuid;
 use zeroize::Zeroize;
 
 use crate::{
-    admin::{hash_password, normalize_username, validate_password},
+    admin::{
+        hash_password, normalize_username, password_hasher, password_needs_rehash,
+        validate_password,
+    },
     config::Config,
     db::{Account, Db},
 };
@@ -46,6 +49,7 @@ pub struct AppState {
     sessions: RwLock<HashMap<Uuid, LiveSession>>,
     admission: Mutex<Admission>,
     auth_buckets: Mutex<HashMap<IpAddr, TokenBucket>>,
+    auth_account_buckets: Mutex<HashMap<String, TokenBucket>>,
     auth_hash_gate: Arc<Semaphore>,
     config: Config,
     dummy_password_phc: String,
@@ -94,9 +98,13 @@ impl TokenBucket {
     }
 
     fn take(&mut self, per_minute: u32, burst: u32) -> bool {
+        self.take_rate(f64::from(per_minute) / 60.0, burst)
+    }
+
+    fn take_rate(&mut self, tokens_per_second: f64, burst: u32) -> bool {
         let now = Instant::now();
         self.tokens = (self.tokens
-            + now.duration_since(self.updated).as_secs_f64() * f64::from(per_minute) / 60.0)
+            + now.duration_since(self.updated).as_secs_f64() * tokens_per_second)
             .min(f64::from(burst));
         self.updated = now;
         if self.tokens < 1.0 {
@@ -118,6 +126,7 @@ impl AppState {
             sessions: RwLock::new(HashMap::new()),
             admission: Mutex::new(Admission::default()),
             auth_buckets: Mutex::new(HashMap::new()),
+            auth_account_buckets: Mutex::new(HashMap::new()),
             auth_hash_gate: Arc::new(Semaphore::new(config.auth_hash_concurrency)),
             config,
             dummy_password_phc,
@@ -220,6 +229,16 @@ impl AppState {
         sessions
     }
 
+    async fn online_devices(&self, account_id: &str) -> Vec<String> {
+        self.connections
+            .read()
+            .await
+            .iter()
+            .filter(|(_, connection)| connection.account_id == account_id)
+            .map(|(device_id, _)| device_id.clone())
+            .collect()
+    }
+
     pub(crate) async fn kick_session(&self, id: Uuid, reason: &str) -> bool {
         self.sessions
             .read()
@@ -255,7 +274,27 @@ impl AppState {
         self.db.cleanup_expired_pairing_events(now).await?;
         let retention_ms = i64::from(self.config.audit_retention_days) * 24 * 60 * 60 * 1000;
         self.db.cleanup_audit(now - retention_ms).await?;
+        let delivered_retention_ms =
+            i64::from(self.config.delivered_retention_days) * 24 * 60 * 60 * 1000;
+        let cleaned = self
+            .db
+            .cleanup_delivered_envelopes(now - delivered_retention_ms, 1000)
+            .await?;
+        if cleaned.envelopes > 0 {
+            tracing::info!(
+                envelopes = cleaned.envelopes,
+                ciphertext_bytes = cleaned.ciphertext_bytes,
+                "expired delivered ciphertext cleaned"
+            );
+        }
         Ok(())
+    }
+
+    pub(crate) async fn ready(&self) -> bool {
+        sqlx::query_scalar::<_, i64>("SELECT 1")
+            .fetch_one(self.db.pool())
+            .await
+            .is_ok()
     }
 
     async fn push_device(&self, device: &str, message: v1::Frame) {
@@ -291,7 +330,22 @@ pub async fn upgrade(
     headers: HeaderMap,
     ws: WebSocketUpgrade,
 ) -> Response {
-    if state.config.trusted_proxy_tls
+    if state.config.reject_websocket_origins && headers.contains_key("origin") {
+        return (
+            StatusCode::FORBIDDEN,
+            "browser WebSocket origins are not accepted\n",
+        )
+            .into_response();
+    }
+    let trusted_proxy = state.config.is_trusted_proxy(peer.ip());
+    if state.config.trusted_proxy_tls && !trusted_proxy {
+        return (
+            StatusCode::FORBIDDEN,
+            "connection did not come from a trusted proxy\n",
+        )
+            .into_response();
+    }
+    if trusted_proxy
         && headers
             .get("x-forwarded-proto")
             .and_then(|value| value.to_str().ok())
@@ -303,7 +357,11 @@ pub async fn upgrade(
         )
             .into_response();
     }
-    let source_ip = forwarded_ip(&state, &headers).unwrap_or(peer.ip());
+    let source_ip = if trusted_proxy {
+        forwarded_ip(&headers).unwrap_or(peer.ip())
+    } else {
+        peer.ip()
+    };
     if !state.admit(source_ip).await {
         return (StatusCode::TOO_MANY_REQUESTS, "connection limit exceeded\n").into_response();
     }
@@ -318,6 +376,7 @@ struct Challenge {
     device_id: String,
     nonce: Vec<u8>,
     expires_at_ms: i64,
+    capabilities: Vec<String>,
 }
 
 struct ConnectionContext {
@@ -332,6 +391,7 @@ struct Session {
     device_id: String,
     pending: bool,
     password_change_required: bool,
+    capabilities: Vec<String>,
 }
 
 async fn connection(socket: WebSocket, state: Arc<AppState>, source_ip: IpAddr) {
@@ -462,12 +522,13 @@ async fn connection(socket: WebSocket, state: Arc<AppState>, source_ip: IpAddr) 
         .await
         {
             debug!(%error, "request rejected");
+            let public = public_error(&error);
             send_error(
                 &tx,
                 &request_id,
-                "request_rejected",
-                public_error_message(&error),
-                false,
+                public.code,
+                public.message,
+                public.retryable,
             )
             .await;
         }
@@ -508,6 +569,14 @@ async fn handle_frame(
             if !valid_uuid(&hello.device_id) {
                 bail!("invalid device id");
             }
+            if hello.capabilities.len() > 32
+                || hello
+                    .capabilities
+                    .iter()
+                    .any(|capability| capability.is_empty() || capability.len() > 64)
+            {
+                bail!("invalid client capabilities");
+            }
             let mut nonce = vec![0_u8; 32];
             OsRng.fill_bytes(&mut nonce);
             let expires_at_ms = now_ms() + 30_000;
@@ -516,6 +585,7 @@ async fn handle_frame(
                 device_id: hello.device_id,
                 nonce: nonce.clone(),
                 expires_at_ms,
+                capabilities: hello.capabilities,
             });
             tx.send(frame(
                 request_id,
@@ -555,11 +625,16 @@ async fn handle_frame(
                 challenge.expires_at_ms,
             );
             verify_signature(&device.auth_signing_key, &payload, &auth.signature)?;
+            state
+                .db
+                .record_device_authentication(&auth.device_id, now_ms())
+                .await?;
             let session = Session {
                 account: account.clone(),
                 device_id: auth.device_id,
                 pending: false,
                 password_change_required: account.require_password_change,
+                capabilities: challenge.capabilities,
             };
             state
                 .register(&session, token, tx.clone(), disconnect.clone(), source_ip)
@@ -588,7 +663,7 @@ async fn handle_frame(
                 auth.password.zeroize();
                 bail!("invalid credentials");
             }
-            if !allow_password_attempt(state, source_ip).await {
+            if !allow_password_attempt(state, source_ip, &challenge.username).await {
                 auth.password.zeroize();
                 bail!("too many authentication attempts; retry later");
             }
@@ -603,9 +678,11 @@ async fn handle_frame(
                 .acquire_owned()
                 .await
                 .map_err(|_| anyhow!("authentication service unavailable"))?;
-            let valid = verify_password(phc, auth.password.clone()).await;
+            let verification = verify_password(phc, auth.password.clone()).await;
             auth.password.zeroize();
-            let Some(account) = account.filter(|account| valid && account.state == "active") else {
+            let Some(mut account) =
+                account.filter(|account| verification.valid && account.state == "active")
+            else {
                 tokio::time::sleep(Duration::from_millis(300)).await;
                 let _ = state
                     .db
@@ -620,6 +697,13 @@ async fn handle_frame(
                     .await;
                 bail!("invalid credentials");
             };
+            if let Some(replacement) = verification.replacement_phc {
+                state
+                    .db
+                    .set_password(&account.id, &replacement, account.require_password_change)
+                    .await?;
+                account.password_phc = replacement;
+            }
             let existing_pending =
                 if let Some(device) = state.db.device(&account.id, &challenge.device_id).await? {
                     if !device.pending {
@@ -634,6 +718,7 @@ async fn handle_frame(
                 device_id: challenge.device_id,
                 pending: true,
                 password_change_required: false,
+                capabilities: challenge.capabilities,
             };
             send_authenticated(tx, &request_id, &session).await?;
             if existing_pending {
@@ -792,13 +877,13 @@ async fn handle_frame(
                 .acquire_owned()
                 .await
                 .map_err(|_| anyhow!("authentication service unavailable"))?;
-            let valid = verify_password(
+            let verification = verify_password(
                 session.account.password_phc.clone(),
                 change.current_password.clone(),
             )
             .await;
             change.current_password.zeroize();
-            if !valid {
+            if !verification.valid {
                 change.new_password.zeroize();
                 bail!("current password is incorrect");
             }
@@ -925,6 +1010,7 @@ async fn handle_frame(
                     &session.device_id,
                     &send.envelopes,
                     now,
+                    state.config.storage_limits(),
                 )
                 .await?;
             for (device, _) in destinations {
@@ -1189,6 +1275,57 @@ async fn handle_frame(
             tx.send(frame(request_id, Body::OperationOk(v1::OperationOk {})))
                 .await?;
         }
+        Body::ListOwnDevices(_) => {
+            let session = usable_session(session_slot)?;
+            if !session
+                .capabilities
+                .iter()
+                .any(|capability| capability == CAPABILITY_OWN_DEVICES)
+            {
+                bail!("client did not negotiate own device management");
+            }
+            let devices = own_device_list(state, &session.account.id, &session.device_id).await?;
+            tx.send(frame(request_id, Body::OwnDeviceList(devices)))
+                .await?;
+        }
+        Body::RevokeOwnDevice(revoke) => {
+            let session = usable_session(session_slot)?;
+            if !session
+                .capabilities
+                .iter()
+                .any(|capability| capability == CAPABILITY_OWN_DEVICES)
+            {
+                bail!("client did not negotiate own device management");
+            }
+            if !valid_uuid(&revoke.device_id) {
+                bail!("invalid device id");
+            }
+            if revoke.device_id == session.device_id {
+                bail!("cannot revoke the current device");
+            }
+            if !state
+                .db
+                .revoke_own_device(&session.account.id, &revoke.device_id)
+                .await?
+            {
+                bail!("device is not active or does not belong to this account");
+            }
+            state.kick_device(&revoke.device_id, "access_revoked").await;
+            state
+                .db
+                .audit(
+                    "device",
+                    &session.account.username,
+                    "self_service_revoke",
+                    &revoke.device_id,
+                    "success",
+                    (Some(&source_ip.to_string()), &session.device_id),
+                )
+                .await?;
+            let devices = own_device_list(state, &session.account.id, &session.device_id).await?;
+            tx.send(frame(request_id, Body::OwnDeviceList(devices)))
+                .await?;
+        }
         Body::Ping(ping) => {
             tx.send(frame(
                 request_id,
@@ -1262,6 +1399,10 @@ async fn send_authenticated(
                 .unwrap_or_default(),
             roster_revision: session.account.roster_revision,
             bootstrap_mode: bootstrap_mode as i32,
+            capabilities: vec![
+                CAPABILITY_OWN_DEVICES.to_owned(),
+                CAPABILITY_STABLE_ERRORS.to_owned(),
+            ],
         }),
     ))
     .await?;
@@ -1320,6 +1461,30 @@ async fn push_post_auth(
     Ok(())
 }
 
+async fn own_device_list(
+    state: &AppState,
+    account_id: &str,
+    current_device_id: &str,
+) -> Result<v1::OwnDeviceList> {
+    let online = state.online_devices(account_id).await;
+    let mut devices = state.db.own_devices(account_id).await?;
+    for device in &mut devices {
+        device.current = device.device_id == current_device_id;
+        device.online = online
+            .iter()
+            .any(|online_id| online_id == &device.device_id);
+    }
+    devices.sort_by_key(|device| {
+        (
+            !device.current,
+            device.revoked,
+            device.pending,
+            device.created_at_ms,
+        )
+    });
+    Ok(v1::OwnDeviceList { devices })
+}
+
 async fn send_error(
     tx: &mpsc::Sender<v1::Frame>,
     id: &str,
@@ -1340,34 +1505,69 @@ async fn send_error(
         .await;
 }
 
-async fn verify_password(phc: String, mut password: String) -> bool {
-    tokio::task::spawn_blocking(move || {
-        let verified = PasswordHash::new(&phc).ok().is_some_and(|hash| {
-            Argon2::default()
-                .verify_password(password.as_bytes(), &hash)
-                .is_ok()
-        });
-        password.zeroize();
-        verified
-    })
-    .await
-    .unwrap_or(false)
+struct PasswordVerification {
+    valid: bool,
+    replacement_phc: Option<String>,
 }
 
-async fn allow_password_attempt(state: &AppState, source_ip: IpAddr) -> bool {
-    let mut buckets = state.auth_buckets.lock().await;
-    if buckets.len() >= 10_000 && !buckets.contains_key(&source_ip) {
-        buckets.retain(|_, bucket| bucket.updated.elapsed() < Duration::from_secs(600));
+async fn verify_password(phc: String, mut password: String) -> PasswordVerification {
+    tokio::task::spawn_blocking(move || {
+        let verified = PasswordHash::new(&phc).ok().is_some_and(|hash| {
+            password_hasher()
+                .is_ok_and(|hasher| hasher.verify_password(password.as_bytes(), &hash).is_ok())
+        });
+        let replacement_phc = if verified && password_needs_rehash(&phc) {
+            hash_password(&password).ok()
+        } else {
+            None
+        };
+        password.zeroize();
+        PasswordVerification {
+            valid: verified,
+            replacement_phc,
+        }
+    })
+    .await
+    .unwrap_or(PasswordVerification {
+        valid: false,
+        replacement_phc: None,
+    })
+}
+
+async fn allow_password_attempt(state: &AppState, source_ip: IpAddr, username: &str) -> bool {
+    {
+        let mut buckets = state.auth_buckets.lock().await;
+        if buckets.len() >= 10_000 && !buckets.contains_key(&source_ip) {
+            buckets.retain(|_, bucket| bucket.updated.elapsed() < Duration::from_secs(600));
+            if buckets.len() >= 10_000 {
+                return false;
+            }
+        }
+        if !buckets
+            .entry(source_ip)
+            .or_insert_with(|| TokenBucket::new(state.config.auth_attempt_burst))
+            .take(
+                state.config.auth_attempts_per_minute,
+                state.config.auth_attempt_burst,
+            )
+        {
+            return false;
+        }
+    }
+
+    let mut buckets = state.auth_account_buckets.lock().await;
+    if buckets.len() >= 10_000 && !buckets.contains_key(username) {
+        buckets.retain(|_, bucket| bucket.updated.elapsed() < Duration::from_secs(60 * 60));
         if buckets.len() >= 10_000 {
             return false;
         }
     }
     buckets
-        .entry(source_ip)
-        .or_insert_with(|| TokenBucket::new(state.config.auth_attempt_burst))
-        .take(
-            state.config.auth_attempts_per_minute,
-            state.config.auth_attempt_burst,
+        .entry(username.to_owned())
+        .or_insert_with(|| TokenBucket::new(10))
+        .take_rate(
+            f64::from(state.config.auth_attempts_per_account_per_hour) / 3600.0,
+            10,
         )
 }
 
@@ -1380,34 +1580,90 @@ fn decrement_count(counts: &mut HashMap<IpAddr, usize>, ip: IpAddr) {
     }
 }
 
-fn forwarded_ip(state: &AppState, headers: &HeaderMap) -> Option<IpAddr> {
-    state.config.trusted_proxy_tls.then(|| {
-        headers
-            .get("x-forwarded-for")?
-            .to_str()
-            .ok()?
-            .split(',')
-            .next()?
-            .trim()
-            .parse()
-            .ok()
-    })?
+fn forwarded_ip(headers: &HeaderMap) -> Option<IpAddr> {
+    headers
+        .get("x-forwarded-for")?
+        .to_str()
+        .ok()?
+        .split(',')
+        .next()?
+        .trim()
+        .parse()
+        .ok()
 }
 
-fn public_error_message(error: &anyhow::Error) -> &'static str {
+struct PublicError {
+    code: &'static str,
+    message: &'static str,
+    retryable: bool,
+}
+
+fn public_error(error: &anyhow::Error) -> PublicError {
+    if let Some(rejection) = error.downcast_ref::<crate::db::StorageRejection>() {
+        return match rejection {
+            crate::db::StorageRejection::AccountQuota | crate::db::StorageRejection::TotalQuota => {
+                PublicError {
+                    code: "storage_quota_exceeded",
+                    message: "server ciphertext storage quota exceeded",
+                    retryable: false,
+                }
+            }
+            crate::db::StorageRejection::DiskPressure => PublicError {
+                code: "storage_pressure",
+                message: "server disk reserve reached; retry after storage cleanup",
+                retryable: true,
+            },
+        };
+    }
     let message = error.to_string();
     if message.contains("too many authentication attempts") {
-        "too many authentication attempts; retry later"
+        PublicError {
+            code: "rate_limited",
+            message: "too many authentication attempts; retry later",
+            retryable: true,
+        }
     } else if message.contains("password must contain") {
-        "password does not meet the server policy"
+        PublicError {
+            code: "password_policy",
+            message: "password does not meet the server policy",
+            retryable: false,
+        }
     } else if message.contains("invalid credentials") {
-        "invalid credentials"
+        PublicError {
+            code: "invalid_credentials",
+            message: "invalid credentials",
+            retryable: false,
+        }
     } else if message.contains("password change is required") {
-        "password change is required"
+        PublicError {
+            code: "password_change_required",
+            message: "password change is required",
+            retryable: false,
+        }
+    } else if message.contains("recipient device is unavailable") {
+        PublicError {
+            code: "recipient_roster_changed",
+            message: "recipient device roster changed; refresh and retry",
+            retryable: true,
+        }
+    } else if message.contains("cannot revoke the current device") {
+        PublicError {
+            code: "device_revoke_forbidden",
+            message: "the current device cannot revoke itself",
+            retryable: false,
+        }
     } else if message.contains("user not found") {
-        "user not found"
+        PublicError {
+            code: "user_not_found",
+            message: "user not found",
+            retryable: false,
+        }
     } else {
-        "request rejected"
+        PublicError {
+            code: "request_rejected",
+            message: "request rejected",
+            retryable: false,
+        }
     }
 }
 

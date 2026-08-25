@@ -1,5 +1,5 @@
-ARG RUST_BASE=rust:1.95.0-bookworm
-ARG RUNTIME_BASE=debian:bookworm-slim
+ARG RUST_BASE=rust:1.95.0-bookworm@sha256:6258907abe69656e41cd992e0b705cdcfabcbbe3db374f92ed2d47121282d4a1
+ARG RUNTIME_BASE=debian:bookworm-slim@sha256:88200866dfff7ea7f5cbcb6ec7c8a701889efe6fe859fe64d6990e4b07ea4171
 
 FROM ${RUST_BASE} AS builder
 WORKDIR /build
