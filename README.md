@@ -610,8 +610,8 @@ CI 还会执行依赖许可证、来源和安全公告策略检查，实际构�
 推送版本标签后，GitHub Actions 会构建并发布 Linux x86_64、macOS Intel、macOS Apple Silicon 和 Windows x86_64 客户端压缩包，同时生成 SHA-256 校验文件、CycloneDX JSON SBOM 压缩包和 GitHub build provenance attestation。Intel 构建使用 `macos-15-intel` runner：
 
 ```console
-git tag v0.3.0
-git push origin v0.3.0
+git tag v0.3.1
+git push origin v0.3.1
 ```
 
 下载后先核验旁边的 `.sha256`。公开仓库的发布资产还可以使用 GitHub CLI 验证构建来源：

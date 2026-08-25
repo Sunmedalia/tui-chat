@@ -77,6 +77,39 @@ struct StoredProfile {
     server_capabilities: Vec<String>,
 }
 
+// v0.2.x used the same TCP3 marker with postcard before server_capabilities was
+// added. Postcard encodes structs positionally, so serde(default) cannot recover
+// a missing trailing field. Keep the exact old layout for one-way migration.
+#[derive(Serialize, Deserialize)]
+struct LegacyStoredProfileV3 {
+    username: String,
+    account_id: String,
+    server_url: String,
+    identity: Vec<u8>,
+    machine: Vec<u8>,
+    pending: bool,
+    pairing_secret: Option<[u8; 32]>,
+    account_master_public: Vec<u8>,
+    spki_pin: Option<String>,
+}
+
+impl From<LegacyStoredProfileV3> for StoredProfile {
+    fn from(profile: LegacyStoredProfileV3) -> Self {
+        Self {
+            username: profile.username,
+            account_id: profile.account_id,
+            server_url: profile.server_url,
+            identity: profile.identity,
+            machine: profile.machine,
+            pending: profile.pending,
+            pairing_secret: profile.pairing_secret,
+            account_master_public: profile.account_master_public,
+            spki_pin: profile.spki_pin,
+            server_capabilities: Vec::new(),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Contact {
     pub bundle: UserBundle,
@@ -439,8 +472,16 @@ impl LocalStore {
         };
         let blob = decode_encrypted_blob(&row.get::<Vec<u8>, _>("encrypted_blob"))?;
         let decrypted = vault.decrypt(b"profile/v1", &blob)?;
-        let plain: StoredProfile = if let Some(encoded) = decrypted.strip_prefix(b"TCP3") {
+        let plain: StoredProfile = if let Some(encoded) = decrypted.strip_prefix(b"TCP4") {
             postcard::from_bytes(encoded)?
+        } else if let Some(encoded) = decrypted.strip_prefix(b"TCP3") {
+            match postcard::from_bytes(encoded) {
+                Ok(profile) => profile,
+                Err(postcard::Error::DeserializeUnexpectedEnd) => {
+                    postcard::from_bytes::<LegacyStoredProfileV3>(encoded)?.into()
+                }
+                Err(error) => return Err(error.into()),
+            }
         } else {
             serde_json::from_slice(&decrypted)?
         };
@@ -1320,7 +1361,9 @@ fn encode_profile(vault: &VaultSession, profile: &RuntimeProfile) -> Result<Vec<
         spki_pin: profile.spki_pin.clone(),
         server_capabilities: profile.server_capabilities.clone(),
     };
-    let mut encoded = b"TCP3".to_vec();
+    // The marker is part of the schema version. Future positional schema
+    // changes must use a new marker and retain a decoder for this layout.
+    let mut encoded = b"TCP4".to_vec();
     encoded.extend(postcard::to_allocvec(&plain)?);
     Ok(vault.encrypt(b"profile/v1", &encoded)?.to_bytes())
 }
@@ -1637,6 +1680,85 @@ mod tests {
         assert!(!notifications[0].read);
         assert_eq!(store.messages(&vault, "conversation-1").await?.len(), 2);
         assert_eq!(store.cursors().await?, (8, 0));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn v021_and_v030_postcard_profiles_remain_readable() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let store = LocalStore::open(&directory.path().join("client.db")).await?;
+        let vault = store.unlock("test passphrase").await?;
+        let identity = DeviceIdentity::new("account-local", "device-local", "test", true);
+        let account_master_public = identity
+            .master_public_key()
+            .expect("first device has a master key")
+            .to_vec();
+        let legacy = LegacyStoredProfileV3 {
+            username: "local-user".into(),
+            account_id: "account-local".into(),
+            server_url: "ws://127.0.0.1:8080/v1/ws".into(),
+            identity: identity.to_bytes()?,
+            machine: OlmMachine::new().to_bytes()?,
+            pending: false,
+            pairing_secret: None,
+            account_master_public,
+            spki_pin: None,
+        };
+        let mut old_plaintext = b"TCP3".to_vec();
+        old_plaintext.extend(postcard::to_allocvec(&legacy)?);
+        let encrypted = vault.encrypt(b"profile/v1", &old_plaintext)?.to_bytes();
+        sqlx::query(
+            "INSERT INTO profile(singleton, encrypted_blob, updated_at_ms, encryption_version) VALUES(1, ?, 1, 2)",
+        )
+        .bind(encrypted)
+        .execute(&store.pool)
+        .await?;
+
+        let loaded = store
+            .load_profile(&vault)
+            .await?
+            .expect("v0.2.1 profile remains readable");
+        assert_eq!(loaded.username, "local-user");
+        assert!(loaded.server_capabilities.is_empty());
+
+        store.save_profile(&vault, &loaded).await?;
+        let saved: Vec<u8> =
+            sqlx::query_scalar("SELECT encrypted_blob FROM profile WHERE singleton = 1")
+                .fetch_one(&store.pool)
+                .await?;
+        let blob = decode_encrypted_blob(&saved)?;
+        let plaintext = vault.decrypt(b"profile/v1", &blob)?;
+        let encoded = plaintext
+            .strip_prefix(b"TCP4")
+            .expect("profile is migrated to the versioned format");
+        let migrated: StoredProfile = postcard::from_bytes(encoded)?;
+        assert_eq!(migrated.username, "local-user");
+        assert!(migrated.server_capabilities.is_empty());
+
+        let v030 = StoredProfile {
+            username: loaded.username.clone(),
+            account_id: loaded.account_id.clone(),
+            server_url: loaded.server_url.clone(),
+            identity: loaded.identity.to_bytes()?,
+            machine: loaded.machine.to_bytes()?,
+            pending: loaded.pending,
+            pairing_secret: loaded.pairing_secret,
+            account_master_public: loaded.account_master_public.clone(),
+            spki_pin: loaded.spki_pin.clone(),
+            server_capabilities: vec!["own-devices-v1".into()],
+        };
+        let mut v030_plaintext = b"TCP3".to_vec();
+        v030_plaintext.extend(postcard::to_allocvec(&v030)?);
+        let encrypted = vault.encrypt(b"profile/v1", &v030_plaintext)?.to_bytes();
+        sqlx::query("UPDATE profile SET encrypted_blob = ? WHERE singleton = 1")
+            .bind(encrypted)
+            .execute(&store.pool)
+            .await?;
+        let loaded_v030 = store
+            .load_profile(&vault)
+            .await?
+            .expect("v0.3.0 profile remains readable");
+        assert_eq!(loaded_v030.server_capabilities, ["own-devices-v1"]);
         Ok(())
     }
 
