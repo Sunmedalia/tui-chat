@@ -47,9 +47,9 @@ use crate::editor::EditorState;
 use crate::network::RawConnection;
 use crate::{
     local::{
-        ChatMessage, Contact, LocalStore, MESSAGE_PAGE_SIZE, MessageStatus, Notification,
-        NotificationData, NotificationKind, NotificationState, RuntimeProfile, TransferContact,
-        VaultSession,
+        ChatMessage, Contact, ConversationTombstone, LocalStore, MESSAGE_PAGE_SIZE, MessageStatus,
+        Notification, NotificationData, NotificationKind, NotificationState, RuntimeProfile,
+        TransferContact, VaultSession,
     },
     network::RpcClient,
 };
@@ -62,6 +62,8 @@ struct WirePayload {
     sender_username: String,
     sender_account_id: String,
     peer_account_id: String,
+    #[serde(default)]
+    peer_username: String,
     sent_at_ms: i64,
     text: String,
     related_message_id: Option<String>,
@@ -688,8 +690,10 @@ impl App {
             reconnect_at: Instant::now(),
             reconnect_backoff: 1,
         };
+        app.restore_pairing_state_from_notifications()?;
         app.restore_pairing_requests_from_notifications();
         app.resend_outbox().await;
+        let _ = app.sync_pending_conversation_deletions().await;
         let _ = app.sync().await;
         Ok(app)
     }
@@ -697,6 +701,58 @@ impl App {
     fn selected_notification(&self) -> Option<&Notification> {
         self.notification_selected
             .and_then(|index| self.notifications.get(index))
+    }
+
+    fn restore_pairing_state_from_notifications(&mut self) -> Result<()> {
+        if !self.profile.pending {
+            return Ok(());
+        }
+        let Some((pairing_id, peer_device_id, peer_public_key)) =
+            self.notifications.iter().find_map(|notification| {
+                let NotificationData::Pairing {
+                    pending_side: true,
+                    pairing_id,
+                    sas_public_key,
+                    ..
+                } = &notification.data
+                else {
+                    return None;
+                };
+                (notification.state == NotificationState::InProgress).then(|| {
+                    (
+                        pairing_id.clone(),
+                        notification.actor_device_id.clone(),
+                        sas_public_key.clone(),
+                    )
+                })
+            })
+        else {
+            return Ok(());
+        };
+        let secret = self
+            .profile
+            .pairing_secret
+            .ok_or_else(|| anyhow!("本地缺少待批准设备的配对密钥"))?;
+        let peer: [u8; 32] = peer_public_key
+            .as_slice()
+            .try_into()
+            .map_err(|_| anyhow!("已保存的配对公钥无效"))?;
+        let channel = PairingState::from_secret(secret).establish(peer, &pairing_id)?;
+        let sas = channel.sas_decimals();
+        self.pairing = Some(PairingSession {
+            pairing_id,
+            peer_device_id,
+            pending_device: v1::DeviceBundle::default(),
+            channel,
+            role: PairingRole::Pending,
+            our_confirmed: false,
+            peer_confirmed: false,
+        });
+        self.status = format!(
+            "已恢复设备配对；核对短认证码 {}-{}-{} 后可在通知页直接确认",
+            sas.0, sas.1, sas.2
+        );
+        Ok(())
     }
 
     fn restore_pairing_requests_from_notifications(&mut self) {
@@ -708,6 +764,7 @@ impl App {
                 continue;
             }
             let NotificationData::Pairing {
+                pending_side,
                 pairing_id,
                 pending_device_id,
                 pending_device_name,
@@ -717,6 +774,9 @@ impl App {
             else {
                 continue;
             };
+            if *pending_side {
+                continue;
+            }
             if self
                 .pairing_requests
                 .iter()
@@ -803,11 +863,58 @@ impl App {
             created_at_ms: old.as_ref().map(|item| item.created_at_ms).unwrap_or(now),
             updated_at_ms: now,
             data: NotificationData::Pairing {
+                pending_side: false,
                 pairing_id: request.pairing_id.clone(),
                 pending_device_id: request.pending_device_id.clone(),
                 pending_device_name: request.pending_device_name.clone(),
                 sas_public_key: request.sas_public_key.clone(),
                 pending_device: pending_device.encode_to_vec(),
+            },
+        };
+        self.store
+            .save_notification(&self.vault, &notification)
+            .await?;
+        self.refresh_notifications().await
+    }
+
+    async fn save_pending_pairing_notification(
+        &mut self,
+        pairing_id: &str,
+        approver_device_id: &str,
+        approver_device_name: &str,
+        approver_public_key: &[u8],
+    ) -> Result<()> {
+        let old = self
+            .store
+            .notification_by_request_id(&self.vault, pairing_id)
+            .await?;
+        let own_device: v1::DeviceBundle = self
+            .profile
+            .identity
+            .public_device(self.profile.machine.account())?
+            .into();
+        let now = now_ms();
+        let notification = Notification {
+            id: old
+                .as_ref()
+                .map(|item| item.id.clone())
+                .unwrap_or_else(|| Uuid::new_v4().to_string()),
+            kind: NotificationKind::Pairing,
+            request_id: pairing_id.to_owned(),
+            actor_account_id: self.profile.account_id.clone(),
+            actor_username: approver_device_name.to_owned(),
+            actor_device_id: approver_device_id.to_owned(),
+            state: NotificationState::InProgress,
+            read: old.as_ref().is_some_and(|item| item.read),
+            created_at_ms: old.as_ref().map(|item| item.created_at_ms).unwrap_or(now),
+            updated_at_ms: now,
+            data: NotificationData::Pairing {
+                pending_side: true,
+                pairing_id: pairing_id.to_owned(),
+                pending_device_id: own_device.device_id.clone(),
+                pending_device_name: own_device.device_name.clone(),
+                sas_public_key: approver_public_key.to_vec(),
+                pending_device: own_device.encode_to_vec(),
             },
         };
         self.store
@@ -990,6 +1097,7 @@ impl App {
         match notification.kind {
             NotificationKind::Pairing => {
                 let NotificationData::Pairing {
+                    pending_side,
                     pairing_id,
                     pending_device_id,
                     pending_device_name,
@@ -999,6 +1107,16 @@ impl App {
                 else {
                     bail!("配对通知数据无效");
                 };
+                if pending_side {
+                    if self
+                        .pairing
+                        .as_ref()
+                        .is_some_and(|pairing| pairing.pairing_id == pairing_id)
+                    {
+                        return self.confirm_pairing().await;
+                    }
+                    bail!("配对通道尚未建立；请让旧设备重新点击“开始配对”");
+                }
                 let device = v1::DeviceBundle::decode(pending_device.as_slice())?;
                 if !self
                     .pairing_requests
@@ -1222,6 +1340,12 @@ impl App {
         }
         if self.connected {
             *heartbeat_counter = heartbeat_counter.wrapping_add(1);
+            if heartbeat_counter.is_multiple_of(5) {
+                self.resend_outbox().await;
+                if let Err(error) = self.sync_pending_conversation_deletions().await {
+                    tracing::warn!(%error, "failed to synchronize conversation deletion");
+                }
+            }
             if heartbeat_counter.is_multiple_of(20) {
                 let _ = self
                     .rpc
@@ -2278,10 +2402,40 @@ impl App {
                 contact.identity_changed,
             )
         });
+        let pairing_pending_side = matches!(
+            &notification.data,
+            NotificationData::Pairing {
+                pending_side: true,
+                ..
+            }
+        );
+        let active_pairing = self
+            .pairing
+            .as_ref()
+            .filter(|pairing| pairing.pairing_id == notification.request_id);
+        let pairing_already_confirmed = active_pairing.is_some_and(|pairing| pairing.our_confirmed);
         let (kind, action) = match notification.kind {
+            NotificationKind::Pairing if pairing_pending_side && pairing_already_confirmed => (
+                "新设备配对确认",
+                "本设备已确认短认证码，正在等待旧设备完成批准".to_owned(),
+            ),
+            NotificationKind::Pairing if pairing_pending_side && active_pairing.is_some() => (
+                "新设备配对确认",
+                "与旧设备比较短认证码；完全一致后点击“短码一致，确认”".to_owned(),
+            ),
+            NotificationKind::Pairing if pairing_pending_side => (
+                "新设备配对确认",
+                "等待旧设备重新开始配对并建立短认证码通道".to_owned(),
+            ),
             NotificationKind::Pairing => (
                 "多设备配对请求",
-                "Enter 开始 SAS 配对；双方核对短认证码后输入 /confirm".to_owned(),
+                if pairing_already_confirmed {
+                    "本设备已确认短认证码，正在等待新设备确认".to_owned()
+                } else if active_pairing.is_some() {
+                    "与新设备比较短认证码；完全一致后点击“短码一致，确认”".to_owned()
+                } else {
+                    "Enter 或点击“开始配对”，随后在两台设备通知页核对短认证码".to_owned()
+                },
             ),
             NotificationKind::ChatRequest => {
                 let outgoing = matches!(
@@ -2334,6 +2488,19 @@ impl App {
             Line::from(format!("状态：{state}")),
             Line::from(format!("请求 ID：{}", notification.request_id)),
         ];
+        if let Some(pairing) = active_pairing {
+            let sas = pairing.channel.sas_decimals();
+            lines.push(Line::from(""));
+            lines.push(Line::from(vec![
+                Span::styled("短认证码：", Style::default().fg(Color::DarkGray)),
+                Span::styled(
+                    format!("{}-{}-{}", sas.0, sas.1, sas.2),
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                ),
+            ]));
+        }
         if matches!(
             notification.state,
             NotificationState::Accepted | NotificationState::Completed
@@ -2366,18 +2533,18 @@ impl App {
                     NotificationState::Pending | NotificationState::InProgress
                 ) =>
             {
-                let label = if self
-                    .pairing
-                    .as_ref()
-                    .is_some_and(|pairing| pairing.pairing_id == notification.request_id)
-                {
-                    "确认 SAS"
+                let label = if pairing_already_confirmed {
+                    None
+                } else if active_pairing.is_some() {
+                    Some("短码一致，确认")
+                } else if pairing_pending_side {
+                    None
                 } else if notification.state == NotificationState::InProgress {
-                    "继续配对"
+                    Some("重新开始配对")
                 } else {
-                    "开始配对"
+                    Some("开始配对")
                 };
-                (Some((label, Color::Yellow)), None)
+                (label.map(|label| (label, Color::Cyan)), None)
             }
             NotificationKind::ChatRequest
                 if notification.state == NotificationState::Pending
@@ -2513,11 +2680,19 @@ impl App {
                 username,
                 conversation_id,
             } => {
+                let sync_event_id = Uuid::now_v7().to_string();
+                let deleted_at_ms = now_ms();
                 let selected_account = self
                     .selected_contact()
                     .map(|contact| contact.bundle.account_id.clone());
                 self.store
-                    .delete_conversation(&account_id, &conversation_id)
+                    .delete_conversation_everywhere(
+                        &account_id,
+                        &username,
+                        &conversation_id,
+                        &sync_event_id,
+                        deleted_at_ms,
+                    )
                     .await?;
                 self.bundle_cache.remove(&username);
                 self.contacts = self.store.contacts().await?;
@@ -2540,8 +2715,20 @@ impl App {
                     .contact_scroll
                     .min(self.contacts.len().saturating_sub(1));
                 self.refresh_notifications().await?;
-                self.status =
-                    format!("已删除与 {username} 的本机会话；再次收到消息时需要在通知页重新认证");
+                self.status = if !self.connected {
+                    format!(
+                        "已删除与 {username} 的会话；重连后将同步到其他设备，再次联系需在通知页重新认证"
+                    )
+                } else {
+                    match self.sync_pending_conversation_deletions().await {
+                        Ok(_) => format!(
+                            "已删除与 {username} 的会话并同步到其他设备；再次联系需在通知页重新认证"
+                        ),
+                        Err(error) => format!(
+                            "已在本机删除与 {username} 的会话；跨设备同步将自动重试：{error:#}"
+                        ),
+                    }
+                };
             }
             DeleteTarget::Notification {
                 notification_id,
@@ -2582,8 +2769,8 @@ impl App {
                 (
                     "删除会话",
                     format!("确定删除与 {username} 的会话？"),
-                    "将删除本机的聊天记录、草稿、联系人入口和相关通知。",
-                    "不会撤回消息；再次收到对方消息时需要重新认证。",
+                    "将删除本账号各设备上的聊天记录、草稿、联系人入口和相关通知。",
+                    "离线设备会在重连后同步删除；再次联系必须从通知页重新认证。",
                 )
             }
             DeleteTarget::Notification { title, .. } => (
@@ -3116,6 +3303,7 @@ impl App {
             sender_username: self.profile.username.clone(),
             sender_account_id: self.profile.account_id.clone(),
             peer_account_id: contact.bundle.account_id.clone(),
+            peer_username: contact.bundle.username.clone(),
             sent_at_ms: sent_at,
             text: text.to_owned(),
             related_message_id: None,
@@ -3279,7 +3467,7 @@ impl App {
         let index = if let Some(device) = requested_device {
             self.pairing_requests
                 .iter()
-                .position(|item| item.pending_device_id == device)
+                .position(|item| item.pending_device_id == device || item.pairing_id == device)
         } else if self.pairing_requests.len() == 1 {
             Some(0)
         } else {
@@ -3308,10 +3496,11 @@ impl App {
                 payload: our_public.to_vec(),
                 sender_device_id: String::new(),
                 server_event_id: 0,
+                sender_device_name: String::new(),
             }))
             .await?;
         self.status = format!(
-            "与 {} 比较短认证码：{}-{}-{}；一致后双方输入 /confirm",
+            "与 {} 比较短认证码：{}-{}-{}；一致后双方在通知页点击确认",
             request.pending_device_name, sas.0, sas.1, sas.2
         );
         self.pairing = Some(PairingSession {
@@ -3344,6 +3533,13 @@ impl App {
             .pairing
             .as_mut()
             .ok_or_else(|| anyhow!("当前没有进行中的配对"))?;
+        if pairing.our_confirmed {
+            self.status = match pairing.role {
+                PairingRole::Pending => "本设备已确认短认证码，正在等待旧设备完成批准".to_owned(),
+                PairingRole::Approver => "本设备已确认短认证码，正在等待新设备确认".to_owned(),
+            };
+            return Ok(());
+        }
         pairing.our_confirmed = true;
         match pairing.role {
             PairingRole::Pending => {
@@ -3358,6 +3554,7 @@ impl App {
                         payload,
                         sender_device_id: String::new(),
                         server_event_id: 0,
+                        sender_device_name: String::new(),
                     }))
                     .await?;
                 self.status = "已确认短认证码，等待旧设备批准并迁移历史".to_owned();
@@ -3366,7 +3563,7 @@ impl App {
                 if pairing.peer_confirmed {
                     self.finish_pairing_as_approver().await?;
                 } else {
-                    self.status = "已确认短认证码，等待新设备确认".to_owned();
+                    self.status = "旧设备已确认短认证码，等待新设备在通知页确认".to_owned();
                 }
             }
         }
@@ -3376,9 +3573,6 @@ impl App {
     async fn handle_pairing_event(&mut self, event: v1::PairingEvent) -> Result<()> {
         match event.event_type.as_str() {
             "sas_public" if self.profile.pending => {
-                if self.pairing.is_some() {
-                    return Ok(());
-                }
                 let secret = self
                     .profile
                     .pairing_secret
@@ -3391,25 +3585,44 @@ impl App {
                 let channel =
                     PairingState::from_secret(secret).establish(peer, &event.pairing_id)?;
                 let sas = channel.sas_decimals();
+                let pairing_id = event.pairing_id.clone();
+                let approver_public_key = event.payload.clone();
+                let approver_device_id = event.sender_device_id.clone();
+                let approver_device_name = if event.sender_device_name.trim().is_empty() {
+                    format!(
+                        "旧设备 {}",
+                        event.sender_device_id.chars().take(8).collect::<String>()
+                    )
+                } else {
+                    event.sender_device_name.clone()
+                };
                 self.status = format!(
-                    "与旧设备比较短认证码：{}-{}-{}；一致后双方输入 /confirm",
-                    sas.0, sas.1, sas.2
+                    "与旧设备 {} 比较短认证码：{}-{}-{}；一致后在通知页点击确认",
+                    approver_device_name, sas.0, sas.1, sas.2
                 );
                 self.pairing = Some(PairingSession {
-                    pairing_id: event.pairing_id,
-                    peer_device_id: event.sender_device_id,
+                    pairing_id: pairing_id.clone(),
+                    peer_device_id: approver_device_id.clone(),
                     pending_device: v1::DeviceBundle::default(),
                     channel,
                     role: PairingRole::Pending,
                     our_confirmed: false,
                     peer_confirmed: false,
                 });
+                self.save_pending_pairing_notification(
+                    &pairing_id,
+                    &approver_device_id,
+                    &approver_device_name,
+                    &approver_public_key,
+                )
+                .await?;
             }
             "sas_confirmed" => {
-                let pairing = self
-                    .pairing
-                    .as_mut()
-                    .ok_or_else(|| anyhow!("收到不属于当前配对的确认"))?;
+                let Some(pairing) = self.pairing.as_mut() else {
+                    self.status =
+                        "收到已失效配对的确认；如设备尚未激活，请在通知页重新开始配对".to_owned();
+                    return Ok(());
+                };
                 if pairing.pairing_id != event.pairing_id
                     || pairing
                         .channel
@@ -3422,7 +3635,7 @@ impl App {
                 if pairing.our_confirmed && matches!(pairing.role, PairingRole::Approver) {
                     self.finish_pairing_as_approver().await?;
                 } else {
-                    self.status = "新设备已确认短认证码；核对无误后输入 /confirm".to_owned();
+                    self.status = "新设备已确认短认证码；核对无误后在通知页点击确认".to_owned();
                 }
             }
             "bootstrap" if self.profile.pending => {
@@ -3570,6 +3783,7 @@ impl App {
                 payload,
                 sender_device_id: String::new(),
                 server_event_id: 0,
+                sender_device_name: String::new(),
             }))
             .await
     }
@@ -3760,10 +3974,106 @@ impl App {
             ) {
                 bail!("端到端载荷校验失败");
             }
+            if payload.kind == "conversation_deleted" {
+                if !sender_is_self
+                    || payload.peer_account_id == self.profile.account_id
+                    || payload.text.trim().is_empty()
+                    || payload.text.chars().count() > 128
+                    || envelope.conversation_id
+                        != conversation_id(&self.profile.account_id, &payload.peer_account_id)
+                {
+                    bail!("跨设备会话删除事件元数据无效");
+                }
+                let selected_account = self
+                    .selected_contact()
+                    .map(|contact| contact.bundle.account_id.clone());
+                let tombstone = ConversationTombstone {
+                    peer_account_id: payload.peer_account_id.clone(),
+                    peer_username: payload.text.clone(),
+                    conversation_id: envelope.conversation_id.clone(),
+                    sync_event_id: payload.message_id.clone(),
+                    deleted_at_ms: payload.sent_at_ms,
+                };
+                let previous_machine = std::mem::replace(&mut self.profile.machine, next_machine);
+                let committed = self
+                    .store
+                    .commit_conversation_deletion(
+                        &self.vault,
+                        &self.profile,
+                        &tombstone,
+                        stored.cursor,
+                    )
+                    .await;
+                if let Err(error) = committed {
+                    self.profile.machine = previous_machine;
+                    return Err(error);
+                }
+                cursor = stored.cursor;
+                self.rpc
+                    .notify(Body::AckEnvelope(v1::AckEnvelope {
+                        envelope_id: envelope.envelope_id,
+                        cursor,
+                    }))
+                    .await?;
+                self.bundle_cache.remove(&tombstone.peer_username);
+                self.contacts = self.store.contacts().await?;
+                let deleted_selected =
+                    selected_account.as_deref() == Some(tombstone.peer_account_id.as_str());
+                self.selected = selected_account
+                    .filter(|account_id| account_id != &tombstone.peer_account_id)
+                    .and_then(|account_id| {
+                        self.contacts
+                            .iter()
+                            .position(|contact| contact.bundle.account_id == account_id)
+                    });
+                if deleted_selected {
+                    self.messages.clear();
+                    self.editor.clear();
+                    self.persisted_draft.clear();
+                    self.message_scroll = 0;
+                    self.new_messages_below = 0;
+                    self.history_exhausted = true;
+                }
+                self.refresh_notifications().await?;
+                self.status = format!(
+                    "另一台设备已删除与 {} 的会话；再次联系必须在通知页重新认证",
+                    tombstone.peer_username
+                );
+                continue;
+            }
+            let tombstoned = self
+                .store
+                .conversation_tombstoned(if sender_is_self {
+                    &payload.peer_account_id
+                } else {
+                    &stored.sender_account_id
+                })
+                .await?;
             let is_control = matches!(
                 payload.kind.as_str(),
                 "read" | "read_batch" | "chat_request" | "chat_response"
             );
+            if sender_is_self && tombstoned && payload.kind == "text" {
+                let previous_machine = std::mem::replace(&mut self.profile.machine, next_machine);
+                let committed = self
+                    .store
+                    .commit_control(&self.vault, &self.profile, stored.cursor)
+                    .await;
+                if let Err(error) = committed {
+                    self.profile.machine = previous_machine;
+                    return Err(error);
+                }
+                cursor = stored.cursor;
+                self.rpc
+                    .notify(Body::AckEnvelope(v1::AckEnvelope {
+                        envelope_id: envelope.envelope_id,
+                        cursor,
+                    }))
+                    .await?;
+                self.status = "已忽略其他设备在已删除会话中产生的旧消息".to_owned();
+                continue;
+            }
+            let verified = verified && !tombstoned;
             if !verified && !is_control {
                 if payload.kind != "text"
                     || payload.text.len() > tui_chat_protocol::MAX_TEXT_BYTES
@@ -3980,11 +4290,37 @@ impl App {
                 if !peer_matches || !matches!(payload.text.as_str(), "accepted" | "rejected") {
                     bail!("会话响应元数据无效");
                 }
-                if let Some(notification) = self
+                let mut notification = self
                     .store
                     .notification_by_request_id(&self.vault, request_id)
-                    .await?
-                {
+                    .await?;
+                if notification.is_none() {
+                    let peer = if sender_is_self {
+                        if payload.peer_username.trim().is_empty() {
+                            None
+                        } else {
+                            let peer = self.lookup_bundle(payload.peer_username.trim()).await?;
+                            if peer.account_id != payload.peer_account_id {
+                                bail!("本账号会话响应同步对象不匹配");
+                            }
+                            validate_bundle(&peer)?;
+                            Some(peer)
+                        }
+                    } else {
+                        Some(bundle.clone())
+                    };
+                    if let Some(peer) = peer {
+                        self.store.upsert_contact(&peer).await?;
+                        notification = Some(synthetic_chat_request_notification(
+                            request_id,
+                            &peer,
+                            &stored.sender_device_id,
+                            !sender_is_self,
+                            now_ms(),
+                        ));
+                    }
+                }
+                if let Some(notification) = notification {
                     if !chat_response_actor_matches(
                         sender_is_self,
                         &notification.actor_account_id,
@@ -4000,14 +4336,22 @@ impl App {
                         true,
                     )
                     .await?;
+                    self.contacts = self.store.contacts().await?;
                     self.status = if payload.text == "accepted" {
                         self.selected = self.contacts.iter().position(|contact| {
                             contact.bundle.account_id == notification.actor_account_id
                         });
-                        format!(
-                            "{} 已接受会话请求；在通知详情比较安全码后点击“已核对，认证”",
-                            notification.actor_username
-                        )
+                        if sender_is_self {
+                            format!(
+                                "另一台设备已接受 {} 的会话请求；在通知详情比较安全码后点击“已核对，认证”",
+                                notification.actor_username
+                            )
+                        } else {
+                            format!(
+                                "{} 已接受会话请求；在通知详情比较安全码后点击“已核对，认证”",
+                                notification.actor_username
+                            )
+                        }
                     } else {
                         format!("{} 拒绝了会话请求", notification.actor_username)
                     };
@@ -4156,6 +4500,7 @@ impl App {
             sender_username: self.profile.username.clone(),
             sender_account_id: self.profile.account_id.clone(),
             peer_account_id: recipient.account_id.clone(),
+            peer_username: recipient.username.clone(),
             sent_at_ms,
             text: String::new(),
             related_message_id: None,
@@ -4237,6 +4582,7 @@ impl App {
             sender_username: self.profile.username.clone(),
             sender_account_id: self.profile.account_id.clone(),
             peer_account_id: recipient.account_id.clone(),
+            peer_username: recipient.username.clone(),
             sent_at_ms,
             text: String::new(),
             related_message_id: None,
@@ -4271,6 +4617,7 @@ impl App {
             sender_username: self.profile.username.clone(),
             sender_account_id: self.profile.account_id.clone(),
             peer_account_id: recipient.account_id.clone(),
+            peer_username: recipient.username.clone(),
             sent_at_ms,
             text: recipient.username.clone(),
             related_message_id: None,
@@ -4364,6 +4711,7 @@ impl App {
             sender_username: self.profile.username.clone(),
             sender_account_id: self.profile.account_id.clone(),
             peer_account_id: recipient.account_id.clone(),
+            peer_username: recipient.username.clone(),
             sent_at_ms,
             text: if accepted { "accepted" } else { "rejected" }.to_owned(),
             related_message_id: Some(request_id.to_owned()),
@@ -4437,6 +4785,110 @@ impl App {
         Ok(())
     }
 
+    async fn sync_pending_conversation_deletions(&mut self) -> Result<usize> {
+        if !self.connected || self.profile.pending {
+            return Ok(0);
+        }
+        let tombstones = self.store.pending_conversation_deletions().await?;
+        if tombstones.is_empty() {
+            return Ok(0);
+        }
+        let username = self.profile.username.clone();
+        let self_bundle = self.lookup_bundle_fresh(&username).await?;
+        validate_bundle(&self_bundle)?;
+        if self_bundle.account_id != self.profile.account_id
+            || self_bundle.account_master_key != self.profile.account_master_public
+        {
+            bail!("服务器返回的本账号设备列表不匹配");
+        }
+        let target_devices: Vec<_> = self_bundle
+            .devices
+            .iter()
+            .filter(|device| {
+                !device.revoked && device.device_id != self.profile.identity.device_id()
+            })
+            .cloned()
+            .collect();
+        let mut synced = 0;
+        for tombstone in tombstones {
+            if self.store.outbox_contains(&tombstone.sync_event_id).await? {
+                continue;
+            }
+            if target_devices.is_empty() {
+                self.store
+                    .mark_conversation_deletion_synced(&tombstone.sync_event_id)
+                    .await?;
+                synced += 1;
+                continue;
+            }
+            if conversation_id(&self.profile.account_id, &tombstone.peer_account_id)
+                != tombstone.conversation_id
+            {
+                bail!("待同步的会话删除记录不匹配");
+            }
+            let payload = serde_json::to_vec(&WirePayload {
+                version: 3,
+                kind: "conversation_deleted".into(),
+                message_id: tombstone.sync_event_id.clone(),
+                sender_username: self.profile.username.clone(),
+                sender_account_id: self.profile.account_id.clone(),
+                peer_account_id: tombstone.peer_account_id.clone(),
+                peer_username: tombstone.peer_username.clone(),
+                sent_at_ms: tombstone.deleted_at_ms,
+                text: tombstone.peer_username.clone(),
+                related_message_id: None,
+                related_message_ids: vec![],
+            })?;
+            let mut next_machine = OlmMachine::from_bytes(&self.profile.machine.to_bytes()?)?;
+            let mut envelopes = Vec::with_capacity(target_devices.len());
+            for device in &target_devices {
+                verify_device_bundle(
+                    &self_bundle.account_master_key,
+                    &self_bundle.account_id,
+                    device,
+                )?;
+                let encrypted = self
+                    .encrypt_for(&mut next_machine, device, &self_bundle.account_id, &payload)
+                    .await?;
+                envelopes.push(EncryptedEnvelope {
+                    envelope_id: Uuid::now_v7().to_string(),
+                    logical_message_id: tombstone.sync_event_id.clone(),
+                    conversation_id: tombstone.conversation_id.clone(),
+                    recipient_account_id: self_bundle.account_id.clone(),
+                    recipient_device_id: device.device_id.clone(),
+                    ciphertext: encrypted.ciphertext,
+                    olm_message_type: encrypted.message_type,
+                    client_sent_at_ms: tombstone.deleted_at_ms,
+                });
+            }
+            let queued_frame = frame(
+                Uuid::new_v4().to_string(),
+                Body::SendEnvelopes(SendEnvelopes { envelopes }),
+            );
+            let previous_machine = std::mem::replace(&mut self.profile.machine, next_machine);
+            if let Err(error) = self
+                .store
+                .commit_control_outgoing(
+                    &self.vault,
+                    &self.profile,
+                    &tombstone.sync_event_id,
+                    &encode_frame(&queued_frame),
+                )
+                .await
+            {
+                self.profile.machine = previous_machine;
+                return Err(error);
+            }
+            self.rpc.request_frame(queued_frame).await?;
+            self.store.remove_outbox(&tombstone.sync_event_id).await?;
+            self.store
+                .mark_conversation_deletion_synced(&tombstone.sync_event_id)
+                .await?;
+            synced += 1;
+        }
+        Ok(synced)
+    }
+
     async fn resend_outbox(&mut self) {
         let Ok(items) = self.store.outbox().await else {
             return;
@@ -4448,6 +4900,10 @@ impl App {
             };
             if result.is_ok() {
                 let _ = self.store.remove_outbox(&logical_id).await;
+                let _ = self
+                    .store
+                    .mark_conversation_deletion_synced(&logical_id)
+                    .await;
                 let _ = self
                     .store
                     .update_status(&logical_id, MessageStatus::Sent)
@@ -4512,6 +4968,7 @@ impl App {
                 self.reconnect_backoff = 1;
                 self.status = "已重新连接，正在补拉离线消息".to_owned();
                 self.resend_outbox().await;
+                let _ = self.sync_pending_conversation_deletions().await;
                 let _ = self.sync().await;
             }
             Err(error) => {
@@ -4995,6 +5452,35 @@ fn wire_metadata_matches(
         && timestamp_matches
 }
 
+fn synthetic_chat_request_notification(
+    request_id: &str,
+    peer: &UserBundle,
+    sender_device_id: &str,
+    outgoing: bool,
+    created_at_ms: i64,
+) -> Notification {
+    Notification {
+        id: Uuid::new_v4().to_string(),
+        kind: NotificationKind::ChatRequest,
+        request_id: request_id.to_owned(),
+        actor_account_id: peer.account_id.clone(),
+        actor_username: peer.username.clone(),
+        actor_device_id: sender_device_id.to_owned(),
+        state: NotificationState::Pending,
+        read: false,
+        created_at_ms,
+        updated_at_ms: created_at_ms,
+        data: NotificationData::ChatRequest {
+            outgoing,
+            request_id: request_id.to_owned(),
+            sender_account_id: peer.account_id.clone(),
+            sender_username: peer.username.clone(),
+            sender_device_id: sender_device_id.to_owned(),
+            sender_bundle: peer.encode_to_vec(),
+        },
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -5152,6 +5638,7 @@ mod tests {
             sender_username: "alice".into(),
             sender_account_id: "account-a".into(),
             peer_account_id: "account-b".into(),
+            peer_username: "bob".into(),
             sent_at_ms: 42,
             text: String::new(),
             related_message_id: None,
@@ -5163,6 +5650,52 @@ mod tests {
             "alice",
             "request-1",
             42
+        ));
+    }
+
+    #[test]
+    fn legacy_wire_payloads_default_the_peer_username() {
+        let payload: WirePayload = serde_json::from_value(serde_json::json!({
+            "version": 2,
+            "kind": "text",
+            "message_id": "message-1",
+            "sender_username": "alice",
+            "sender_account_id": "account-a",
+            "peer_account_id": "account-b",
+            "sent_at_ms": 42,
+            "text": "hello",
+            "related_message_id": null,
+            "related_message_ids": []
+        }))
+        .expect("legacy payload remains readable");
+        assert!(payload.peer_username.is_empty());
+    }
+
+    #[test]
+    fn a_response_synced_from_another_device_recreates_an_actionable_notification() {
+        let peer = UserBundle {
+            account_id: "account-peer".into(),
+            username: "tom".into(),
+            account_master_key: vec![7; 32],
+            roster_revision: 1,
+            devices: vec![],
+        };
+        let notification = synthetic_chat_request_notification(
+            "request-1",
+            &peer,
+            "device-local-other",
+            false,
+            42,
+        );
+        assert_eq!(notification.actor_username, "tom");
+        assert_eq!(notification.state, NotificationState::Pending);
+        assert!(!notification.read);
+        assert!(matches!(
+            notification.data,
+            NotificationData::ChatRequest {
+                outgoing: false,
+                ..
+            }
         ));
     }
 
@@ -5190,6 +5723,7 @@ mod tests {
             sender_username: "alice".into(),
             sender_account_id: "account".into(),
             peer_account_id: "peer".into(),
+            peer_username: "bob".into(),
             sent_at_ms: 1_000,
             text: String::new(),
             related_message_id: None,

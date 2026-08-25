@@ -8,7 +8,7 @@ use anyhow::Result;
 use prost::Message as _;
 use serde::{Deserialize, Serialize};
 use sqlx::{
-    Row, SqlitePool,
+    Row, Sqlite, SqlitePool, Transaction,
     sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions},
 };
 use tui_chat_crypto::{
@@ -81,6 +81,15 @@ pub struct Contact {
     pub identity_changed: bool,
     pub unread_count: u64,
     pub last_activity_ms: i64,
+}
+
+#[derive(Debug, Clone)]
+pub struct ConversationTombstone {
+    pub peer_account_id: String,
+    pub peer_username: String,
+    pub conversation_id: String,
+    pub sync_event_id: String,
+    pub deleted_at_ms: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -223,6 +232,8 @@ impl TryFrom<&str> for NotificationState {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum NotificationData {
     Pairing {
+        #[serde(default)]
+        pending_side: bool,
         pairing_id: String,
         pending_device_id: String,
         pending_device_name: String,
@@ -600,44 +611,114 @@ impl LocalStore {
         rows.into_iter().map(contact_from_row).collect()
     }
 
+    #[cfg(test)]
     pub async fn delete_conversation(
         &self,
         peer_account_id: &str,
         conversation_id: &str,
     ) -> Result<()> {
         let mut tx = self.pool.begin().await?;
-        sqlx::query(
-            "DELETE FROM outbox WHERE logical_message_id IN (
-                SELECT logical_message_id FROM messages WHERE conversation_id = ?
-             )",
+        delete_conversation_state(&mut tx, peer_account_id, conversation_id).await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    pub async fn delete_conversation_everywhere(
+        &self,
+        peer_account_id: &str,
+        peer_username: &str,
+        conversation_id: &str,
+        sync_event_id: &str,
+        deleted_at_ms: i64,
+    ) -> Result<()> {
+        let mut tx = self.pool.begin().await?;
+        delete_conversation_state(&mut tx, peer_account_id, conversation_id).await?;
+        upsert_conversation_tombstone(
+            &mut tx,
+            peer_account_id,
+            peer_username,
+            conversation_id,
+            sync_event_id,
+            deleted_at_ms,
+            true,
         )
-        .bind(conversation_id)
-        .execute(&mut *tx)
         .await?;
-        sqlx::query("DELETE FROM messages WHERE conversation_id = ?")
-            .bind(conversation_id)
-            .execute(&mut *tx)
-            .await?;
-        sqlx::query("DELETE FROM drafts WHERE conversation_id = ?")
-            .bind(conversation_id)
-            .execute(&mut *tx)
-            .await?;
-        sqlx::query("DELETE FROM conversation_summaries WHERE conversation_id = ?")
-            .bind(conversation_id)
-            .execute(&mut *tx)
-            .await?;
-        sqlx::query(
-            "DELETE FROM notifications
-             WHERE actor_account_id = ? AND kind IN ('chat_request', 'chat_response')",
+        tx.commit().await?;
+        Ok(())
+    }
+
+    pub async fn commit_conversation_deletion(
+        &self,
+        vault: &VaultSession,
+        profile: &RuntimeProfile,
+        tombstone: &ConversationTombstone,
+        cursor: u64,
+    ) -> Result<()> {
+        let profile_blob = encode_profile(vault, profile)?;
+        let mut tx = self.pool.begin().await?;
+        delete_conversation_state(
+            &mut tx,
+            &tombstone.peer_account_id,
+            &tombstone.conversation_id,
         )
-        .bind(peer_account_id)
-        .execute(&mut *tx)
         .await?;
-        sqlx::query("DELETE FROM contacts WHERE account_id = ?")
-            .bind(peer_account_id)
+        upsert_conversation_tombstone(
+            &mut tx,
+            &tombstone.peer_account_id,
+            &tombstone.peer_username,
+            &tombstone.conversation_id,
+            &tombstone.sync_event_id,
+            tombstone.deleted_at_ms,
+            false,
+        )
+        .await?;
+        sqlx::query("INSERT INTO profile(singleton, encrypted_blob, updated_at_ms, encryption_version) VALUES(1, ?, ?, 2) ON CONFLICT(singleton) DO UPDATE SET encrypted_blob=excluded.encrypted_blob, updated_at_ms=excluded.updated_at_ms, encryption_version=2")
+            .bind(profile_blob)
+            .bind(now_ms())
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("UPDATE sync_state SET envelope_cursor = ? WHERE singleton = 1")
+            .bind(cursor as i64)
             .execute(&mut *tx)
             .await?;
         tx.commit().await?;
+        Ok(())
+    }
+
+    pub async fn pending_conversation_deletions(&self) -> Result<Vec<ConversationTombstone>> {
+        let rows = sqlx::query(
+            "SELECT peer_account_id, peer_username, conversation_id, sync_event_id, deleted_at_ms
+             FROM conversation_tombstones WHERE pending_sync = 1 ORDER BY deleted_at_ms",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|row| ConversationTombstone {
+                peer_account_id: row.get("peer_account_id"),
+                peer_username: row.get("peer_username"),
+                conversation_id: row.get("conversation_id"),
+                sync_event_id: row.get("sync_event_id"),
+                deleted_at_ms: row.get("deleted_at_ms"),
+            })
+            .collect())
+    }
+
+    pub async fn conversation_tombstoned(&self, peer_account_id: &str) -> Result<bool> {
+        Ok(sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM conversation_tombstones WHERE peer_account_id = ?",
+        )
+        .bind(peer_account_id)
+        .fetch_one(&self.pool)
+        .await?
+            > 0)
+    }
+
+    pub async fn mark_conversation_deletion_synced(&self, sync_event_id: &str) -> Result<()> {
+        sqlx::query("UPDATE conversation_tombstones SET pending_sync = 0 WHERE sync_event_id = ?")
+            .bind(sync_event_id)
+            .execute(&self.pool)
+            .await?;
         Ok(())
     }
 
@@ -700,10 +781,24 @@ impl LocalStore {
     }
 
     pub async fn verify_contact(&self, account_id: &str) -> Result<()> {
+        let mut tx = self.pool.begin().await?;
         sqlx::query("UPDATE contacts SET verified = 1, identity_changed = 0 WHERE account_id = ?")
             .bind(account_id)
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await?;
+        sqlx::query(
+            "DELETE FROM outbox WHERE logical_message_id IN (
+                SELECT sync_event_id FROM conversation_tombstones WHERE peer_account_id = ?
+             )",
+        )
+        .bind(account_id)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query("DELETE FROM conversation_tombstones WHERE peer_account_id = ?")
+            .bind(account_id)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
         Ok(())
     }
 
@@ -854,6 +949,18 @@ impl LocalStore {
             .into_iter()
             .map(|row| (row.get("logical_message_id"), row.get("encoded_frame")))
             .collect())
+    }
+
+    pub async fn outbox_contains(&self, logical_id: &str) -> Result<bool> {
+        Ok(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM outbox WHERE logical_message_id = ?",
+            )
+            .bind(logical_id)
+            .fetch_one(&self.pool)
+            .await?
+                > 0,
+        )
     }
 
     pub async fn remove_outbox(&self, logical_id: &str) -> Result<()> {
@@ -1011,6 +1118,88 @@ impl LocalStore {
     }
 }
 
+async fn delete_conversation_state(
+    tx: &mut Transaction<'_, Sqlite>,
+    peer_account_id: &str,
+    conversation_id: &str,
+) -> Result<()> {
+    sqlx::query(
+        "DELETE FROM outbox WHERE logical_message_id IN (
+            SELECT logical_message_id FROM messages WHERE conversation_id = ?
+         )",
+    )
+    .bind(conversation_id)
+    .execute(&mut **tx)
+    .await?;
+    sqlx::query("DELETE FROM messages WHERE conversation_id = ?")
+        .bind(conversation_id)
+        .execute(&mut **tx)
+        .await?;
+    sqlx::query("DELETE FROM drafts WHERE conversation_id = ?")
+        .bind(conversation_id)
+        .execute(&mut **tx)
+        .await?;
+    sqlx::query("DELETE FROM conversation_summaries WHERE conversation_id = ?")
+        .bind(conversation_id)
+        .execute(&mut **tx)
+        .await?;
+    sqlx::query(
+        "DELETE FROM notifications
+         WHERE actor_account_id = ? AND kind IN ('chat_request', 'chat_response')",
+    )
+    .bind(peer_account_id)
+    .execute(&mut **tx)
+    .await?;
+    sqlx::query("DELETE FROM contacts WHERE account_id = ?")
+        .bind(peer_account_id)
+        .execute(&mut **tx)
+        .await?;
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn upsert_conversation_tombstone(
+    tx: &mut Transaction<'_, Sqlite>,
+    peer_account_id: &str,
+    peer_username: &str,
+    conversation_id: &str,
+    sync_event_id: &str,
+    deleted_at_ms: i64,
+    pending_sync: bool,
+) -> Result<()> {
+    sqlx::query(
+        "INSERT INTO conversation_tombstones(
+            peer_account_id, peer_username, conversation_id, sync_event_id,
+            deleted_at_ms, pending_sync
+         ) VALUES(?, ?, ?, ?, ?, ?)
+         ON CONFLICT(peer_account_id) DO UPDATE SET
+            peer_username = CASE
+                WHEN excluded.deleted_at_ms >= conversation_tombstones.deleted_at_ms
+                THEN excluded.peer_username ELSE conversation_tombstones.peer_username END,
+            conversation_id = CASE
+                WHEN excluded.deleted_at_ms >= conversation_tombstones.deleted_at_ms
+                THEN excluded.conversation_id ELSE conversation_tombstones.conversation_id END,
+            sync_event_id = CASE
+                WHEN conversation_tombstones.pending_sync = 1
+                THEN conversation_tombstones.sync_event_id
+                WHEN excluded.pending_sync = 1
+                THEN excluded.sync_event_id
+                WHEN excluded.deleted_at_ms >= conversation_tombstones.deleted_at_ms
+                THEN excluded.sync_event_id ELSE conversation_tombstones.sync_event_id END,
+            deleted_at_ms = MAX(excluded.deleted_at_ms, conversation_tombstones.deleted_at_ms),
+            pending_sync = MAX(excluded.pending_sync, conversation_tombstones.pending_sync)",
+    )
+    .bind(peer_account_id)
+    .bind(peer_username)
+    .bind(conversation_id)
+    .bind(sync_event_id)
+    .bind(deleted_at_ms)
+    .bind(i64::from(pending_sync))
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
 fn contact_from_row(row: sqlx::sqlite::SqliteRow) -> Result<Contact> {
     Ok(Contact {
         bundle: UserBundle::decode(row.get::<Vec<u8>, _>("bundle").as_slice())?,
@@ -1089,6 +1278,28 @@ mod tests {
             roster_revision: 1,
             devices: vec![],
         }
+    }
+
+    #[test]
+    fn legacy_pairing_notifications_default_to_the_approver_side() -> Result<()> {
+        let data: NotificationData = serde_json::from_value(serde_json::json!({
+            "Pairing": {
+                "pairing_id": "pairing-1",
+                "pending_device_id": "device-new",
+                "pending_device_name": "laptop",
+                "sas_public_key": [1, 2, 3],
+                "pending_device": [4, 5, 6]
+            }
+        }))?;
+
+        assert!(matches!(
+            data,
+            NotificationData::Pairing {
+                pending_side: false,
+                ..
+            }
+        ));
+        Ok(())
     }
 
     #[tokio::test]
@@ -1391,6 +1602,95 @@ mod tests {
                 .await?;
             assert_eq!(count, 0, "{table} should be empty");
         }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn conversation_deletion_is_synchronized_and_reverification_cancels_stale_work()
+    -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let store = LocalStore::open(&directory.path().join("client.db")).await?;
+        let vault = store.unlock("test passphrase").await?;
+        let identity = DeviceIdentity::new("account-local", "device-local", "test", true);
+        let profile = RuntimeProfile {
+            account_master_public: identity
+                .master_public_key()
+                .expect("first device has a master key")
+                .to_vec(),
+            username: "local-user".into(),
+            account_id: "account-local".into(),
+            server_url: "ws://127.0.0.1:8080/v1/ws".into(),
+            identity,
+            machine: OlmMachine::new(),
+            pending: false,
+            pairing_secret: None,
+            spki_pin: None,
+        };
+        let peer = bundle("account-a", "alice");
+        store.upsert_contact(&peer).await?;
+        store
+            .save_message(
+                &vault,
+                &ChatMessage {
+                    id: "message-1".into(),
+                    conversation_id: "conversation-1".into(),
+                    peer_account_id: "account-a".into(),
+                    sender_account_id: "account-a".into(),
+                    body: "secret".into(),
+                    sent_at_ms: 1,
+                    status: MessageStatus::Delivered,
+                    inbound: true,
+                },
+            )
+            .await?;
+
+        store
+            .delete_conversation_everywhere(
+                "account-a",
+                "alice",
+                "conversation-1",
+                "delete-local",
+                10,
+            )
+            .await?;
+        assert!(store.conversation_tombstoned("account-a").await?);
+        assert_eq!(
+            store.pending_conversation_deletions().await?[0].sync_event_id,
+            "delete-local"
+        );
+        sqlx::query(
+            "INSERT INTO outbox(logical_message_id, encoded_frame, created_at_ms)
+             VALUES('delete-local', X'01', 10)",
+        )
+        .execute(&store.pool)
+        .await?;
+
+        store
+            .commit_conversation_deletion(
+                &vault,
+                &profile,
+                &ConversationTombstone {
+                    peer_account_id: "account-a".into(),
+                    peer_username: "alice".into(),
+                    conversation_id: "conversation-1".into(),
+                    sync_event_id: "delete-remote".into(),
+                    deleted_at_ms: 20,
+                },
+                9,
+            )
+            .await?;
+        assert_eq!(store.cursors().await?, (9, 0));
+        assert!(store.load_profile(&vault).await?.is_some());
+        assert!(store.contacts().await?.is_empty());
+        assert!(store.messages(&vault, "conversation-1").await?.is_empty());
+        let pending = store.pending_conversation_deletions().await?;
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].sync_event_id, "delete-local");
+
+        store.upsert_contact(&peer).await?;
+        store.verify_contact("account-a").await?;
+        assert!(!store.conversation_tombstoned("account-a").await?);
+        assert!(!store.outbox_contains("delete-local").await?);
         Ok(())
     }
 

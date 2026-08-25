@@ -3707,7 +3707,7 @@ dependencies = [
 
 [[package]]
 name = "tui-chat"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "chrono",
@@ -3745,7 +3745,7 @@ dependencies = [
 
 [[package]]
 name = "tui-chat-crypto"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "argon2",
@@ -3770,7 +3770,7 @@ dependencies = [
 
 [[package]]
 name = "tui-chat-protocol"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "bytes",
  "prost",
@@ -3782,7 +3782,7 @@ dependencies = [
 
 [[package]]
 name = "tui-chat-server"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "argon2",

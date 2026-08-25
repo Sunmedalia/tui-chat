@@ -1079,8 +1079,17 @@ async fn handle_frame(
                 )
                 .await?;
             let target = event.target_device_id.clone();
+            let sender_device_name = state
+                .db
+                .device_bundles(&session.account.id, true)
+                .await?
+                .into_iter()
+                .find(|device| device.device_id == session.device_id)
+                .map(|device| device.device_name)
+                .ok_or_else(|| anyhow!("sender device not found"))?;
             let mut forwarded = event;
             forwarded.sender_device_id = session.device_id.clone();
+            forwarded.sender_device_name = sender_device_name;
             forwarded.server_event_id = event_id;
             state
                 .push_device(&target, frame("", Body::PairingEvent(forwarded)))
@@ -1172,6 +1181,7 @@ async fn handle_frame(
                             payload: vec![],
                             sender_device_id: session.device_id.clone(),
                             server_event_id: 0,
+                            sender_device_name: String::new(),
                         }),
                     ),
                 )
@@ -1263,6 +1273,13 @@ async fn push_post_auth(
     tx: &mpsc::Sender<v1::Frame>,
     session: &Session,
 ) -> Result<()> {
+    let device_names: HashMap<_, _> = state
+        .db
+        .device_bundles(&session.account.id, true)
+        .await?
+        .into_iter()
+        .map(|device| (device.device_id, device.device_name))
+        .collect();
     for event in state
         .db
         .pending_pairing_events(&session.device_id, now_ms())
@@ -1275,6 +1292,10 @@ async fn push_post_auth(
                 target_device_id: session.device_id.clone(),
                 event_type: event.event_type,
                 payload: event.payload,
+                sender_device_name: device_names
+                    .get(&event.sender_device_id)
+                    .cloned()
+                    .unwrap_or_else(|| "未知设备".to_owned()),
                 sender_device_id: event.sender_device_id,
                 server_event_id: event.id,
             }),

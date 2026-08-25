@@ -171,6 +171,7 @@ message PairingEvent {
   bytes payload = 4;
   string sender_device_id = 5;
   uint64 server_event_id = 6;
+  string sender_device_name = 7;
 }
 
 message AckPairingEvent { uint64 server_event_id = 1; }
